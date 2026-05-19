@@ -27,6 +27,7 @@ type API struct {
 	StreamExtensionToken string
 
 	extendTimer *time.Timer
+	extendStop  chan struct{}
 }
 
 type Auth struct {
@@ -469,18 +470,53 @@ func (a *API) StartExtendStreamTimer() {
 		return
 	}
 
-	a.extendTimer = time.NewTimer(time.Until(a.StreamExpiresAt) - time.Minute)
+	// Nest streams expire ~5 minutes after the last extension. Re-arm after
+	// each successful ExtendStream so the loop keeps running; without the loop
+	// the stream silently dies at the second expiry (~10 min after connect).
+	a.extendTimer = time.NewTimer(extendDelay(a.StreamExpiresAt))
+	a.extendStop = make(chan struct{})
+	timer, stop := a.extendTimer, a.extendStop
 	go func() {
-		<-a.extendTimer.C
-		if err := a.ExtendStream(); err != nil {
-			return
+		for {
+			select {
+			case <-stop:
+				return
+			case <-timer.C:
+			}
+
+			if err := a.ExtendStream(); err != nil {
+				// Retry once after a short delay to ride out transient errors.
+				select {
+				case <-stop:
+					return
+				case <-time.After(10 * time.Second):
+				}
+				if err := a.ExtendStream(); err != nil {
+					return
+				}
+			}
+
+			timer.Reset(extendDelay(a.StreamExpiresAt))
 		}
 	}()
 }
 
 func (a *API) StopExtendStreamTimer() {
 	if a.extendTimer != nil {
+		close(a.extendStop)
 		a.extendTimer.Stop()
 		a.extendTimer = nil
+		a.extendStop = nil
 	}
+}
+
+// extendDelay returns the wait time before the next stream extension call.
+// Clamped to a 1-second minimum so a stale or already-past expiry doesn't
+// cause a busy-loop of ExtendStream() calls.
+func extendDelay(expiresAt time.Time) time.Duration {
+	d := time.Until(expiresAt) - time.Minute
+	if d < time.Second {
+		return time.Second
+	}
+	return d
 }
