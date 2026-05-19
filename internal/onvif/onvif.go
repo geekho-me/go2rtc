@@ -71,10 +71,14 @@ func onvifDeviceService(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	log.Trace().Msgf("[onvif] server request %s %s:\n%s", r.Method, r.RequestURI, b)
+	log.Trace().
+		Str("remote", r.RemoteAddr).
+		Str("user_agent", r.Header.Get("User-Agent")).
+		Str("op", operation).
+		Msgf("[onvif] server request %s %s:\n%s", r.Method, r.RequestURI, b)
 
 	switch operation {
-	case onvif.ServiceGetServiceCapabilities, // important for Hass
+	case onvif.ServiceGetServiceCapabilities, // important for Hass; routed by URL path below
 		onvif.DeviceGetNetworkInterfaces, // important for Hass
 		onvif.DeviceGetSystemDateAndTime, // important for Hass
 		onvif.DeviceSetSystemDateAndTime, // return just OK
@@ -87,11 +91,24 @@ func onvifDeviceService(w http.ResponseWriter, r *http.Request) {
 		onvif.DeviceGetScopes,
 		onvif.MediaGetVideoEncoderConfiguration,
 		onvif.MediaGetVideoEncoderConfigurations,
+		onvif.MediaGetAudioEncoderConfiguration,
 		onvif.MediaGetAudioEncoderConfigurations,
 		onvif.MediaGetVideoEncoderConfigurationOptions,
 		onvif.MediaGetAudioSources,
-		onvif.MediaGetAudioSourceConfigurations:
-		b = onvif.StaticResponse(operation)
+		onvif.MediaGetAudioSourceConfiguration,
+		onvif.MediaGetAudioSourceConfigurations,
+		onvif.ImagingGetImagingSettings,
+		onvif.ImagingGetOptions,
+		onvif.ImagingGetMoveOptions,
+		onvif.ImagingGetStatus:
+		// GetServiceCapabilities is reused by both Media and Imaging services
+		// (same operation name, different responses). Differentiate by URL.
+		if operation == onvif.ServiceGetServiceCapabilities &&
+			strings.Contains(r.URL.Path, "imaging_service") {
+			b = onvif.GetImagingServiceCapabilitiesResponse()
+		} else {
+			b = onvif.StaticResponse(operation)
+		}
 
 	case onvif.DeviceGetCapabilities:
 		// important for Hass: Media section
@@ -145,7 +162,11 @@ func onvifDeviceService(w http.ResponseWriter, r *http.Request) {
 
 	default:
 		http.Error(w, "unsupported operation", http.StatusBadRequest)
-		log.Warn().Msgf("[onvif] unsupported operation: %s", operation)
+		log.Warn().
+			Str("op", operation).
+			Str("remote", r.RemoteAddr).
+			Str("user_agent", r.Header.Get("User-Agent")).
+			Msg("[onvif] unsupported operation")
 		log.Debug().Msgf("[onvif] unsupported request:\n%s", b)
 		return
 	}

@@ -128,26 +128,50 @@ func atoi(s string) int {
 	return i
 }
 
+// GetPosixTZ returns a POSIX-style TZ string suitable for ONVIF
+// GetSystemDateAndTime responses. ONVIF (per IEEE 1003.1 POSIX) expects
+// strings of the form `std[offset[dst[offset][,start,end]]]`, e.g.
+// "UTC0", "EST5EDT,M3.2.0,M11.1.0".
+//
+// POSIX uses the *reverse* sign convention from ISO 8601: UTC-5 (EST) is
+// written "EST5", UTC+9 (JST) is written "JST-9".
+//
+// We don't try to emit DST rules (Go's tzdata doesn't expose them in an
+// easily-renderable form). Clients that need DST awareness should fall
+// back to UTCDateTime, which we also include in the response.
 func GetPosixTZ(current time.Time) string {
-	// Thanks to https://github.com/Path-Variable/go-posix-time
-	_, offset := current.Zone()
-
+	// In DST, advance past the next transition so we report the standard
+	// offset rather than the DST offset — POSIX's std field is the
+	// non-DST baseline.
+	name, offset := current.Zone()
 	if current.IsDST() {
 		_, end := current.ZoneBounds()
-		endPlus1 := end.Add(time.Hour * 25)
-		_, offset = endPlus1.Zone()
+		stdName, stdOffset := end.Add(time.Hour * 25).Zone()
+		name, offset = stdName, stdOffset
 	}
 
-	var prefix string
-	if offset < 0 {
-		prefix = "GMT+"
-		offset = -offset / 60
-	} else {
-		prefix = "GMT-"
-		offset = offset / 60
+	if name == "" {
+		name = "GMT"
 	}
 
-	return prefix + fmt.Sprintf("%02d:%02d", offset/60, offset%60)
+	// POSIX offset is the negation of the ISO offset (in seconds).
+	posixSec := -offset
+	if posixSec == 0 {
+		return name + "0"
+	}
+
+	sign := ""
+	if posixSec < 0 {
+		sign = "-"
+		posixSec = -posixSec
+	}
+
+	hours := posixSec / 3600
+	mins := (posixSec % 3600) / 60
+	if mins == 0 {
+		return fmt.Sprintf("%s%s%d", name, sign, hours)
+	}
+	return fmt.Sprintf("%s%s%d:%02d", name, sign, hours, mins)
 }
 
 func GetPath(urlOrPath, defPath string) string {

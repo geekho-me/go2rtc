@@ -26,8 +26,10 @@ const (
 )
 
 const (
+	MediaGetAudioEncoderConfiguration        = "GetAudioEncoderConfiguration"
 	MediaGetAudioEncoderConfigurations       = "GetAudioEncoderConfigurations"
 	MediaGetAudioSources                     = "GetAudioSources"
+	MediaGetAudioSourceConfiguration         = "GetAudioSourceConfiguration"
 	MediaGetAudioSourceConfigurations        = "GetAudioSourceConfigurations"
 	MediaGetProfile                          = "GetProfile"
 	MediaGetProfiles                         = "GetProfiles"
@@ -39,6 +41,16 @@ const (
 	MediaGetVideoSources                     = "GetVideoSources"
 	MediaGetVideoSourceConfiguration         = "GetVideoSourceConfiguration"
 	MediaGetVideoSourceConfigurations        = "GetVideoSourceConfigurations"
+)
+
+// Imaging service operations. Note: GetServiceCapabilities is shared with
+// the Media service (same operation name); the dispatcher must differentiate
+// by URL path (/onvif/imaging_service vs /onvif/media_service) when routing.
+const (
+	ImagingGetImagingSettings = "GetImagingSettings"
+	ImagingGetOptions         = "GetOptions"
+	ImagingGetMoveOptions     = "GetMoveOptions"
+	ImagingGetStatus          = "GetStatus"
 )
 
 func GetRequestAction(b []byte) string {
@@ -70,8 +82,11 @@ func GetCapabilitiesResponse(host string) []byte {
 				<tt:RTP_RTSP_TCP>true</tt:RTP_RTSP_TCP>
 			</tt:StreamingCapabilities>
 		</tt:Media>
+		<tt:Imaging>
+			<tt:XAddr>http://%s/onvif/imaging_service</tt:XAddr>
+		</tt:Imaging>
 	</tds:Capabilities>
-</tds:GetCapabilitiesResponse>`, host, host)
+</tds:GetCapabilitiesResponse>`, host, host, host)
 	return e.Bytes()
 }
 
@@ -88,7 +103,12 @@ func GetServicesResponse(host string) []byte {
 		<tds:XAddr>http://%s/onvif/media_service</tds:XAddr>
 		<tds:Version><tt:Major>2</tt:Major><tt:Minor>5</tt:Minor></tds:Version>
 	</tds:Service>
-</tds:GetServicesResponse>`, host, host)
+	<tds:Service>
+		<tds:Namespace>http://www.onvif.org/ver20/imaging/wsdl</tds:Namespace>
+		<tds:XAddr>http://%s/onvif/imaging_service</tds:XAddr>
+		<tds:Version><tt:Major>2</tt:Major><tt:Minor>5</tt:Minor></tds:Version>
+	</tds:Service>
+</tds:GetServicesResponse>`, host, host, host)
 	return e.Bytes()
 }
 
@@ -157,6 +177,8 @@ func appendProfile(e *Envelope, tag, name string) {
 	e.Appendf(`<tt:Name>%s</tt:Name>`, name)
 	appendVideoSourceConfiguration(e, "VideoSourceConfiguration", name)
 	appendVideoEncoderConfiguration(e, "VideoEncoderConfiguration")
+	appendAudioSourceConfiguration(e, "AudioSourceConfiguration")
+	appendAudioEncoderConfiguration(e, "AudioEncoderConfiguration")
 	e.Appendf(`</trt:%s>`, tag)
 }
 
@@ -231,6 +253,130 @@ func appendVideoEncoderConfiguration(e *Envelope, tag string) {
 	</tt:%s>`, tag, tag)
 }
 
+func appendAudioSourceConfiguration(e *Envelope, tag string) {
+	e.Appendf(`<tt:%s token="asc">
+		<tt:Name>ASC</tt:Name>
+		<tt:UseCount>1</tt:UseCount>
+		<tt:SourceToken>audio_source</tt:SourceToken>
+	</tt:%s>`, tag, tag)
+}
+
+func appendAudioEncoderConfiguration(e *Envelope, tag string) {
+	// Encoding=AAC (ONVIF allows G711/G726/AAC). go2rtc transcodes to AAC when
+	// requested via `audio=aac`, so always advertise AAC capability for clients
+	// like UniFi Protect that only set up audio if the profile declares it.
+	e.Appendf(`<tt:%s token="aec">
+		<tt:Name>AEC</tt:Name>
+		<tt:UseCount>1</tt:UseCount>
+		<tt:Encoding>AAC</tt:Encoding>
+		<tt:Bitrate>64</tt:Bitrate>
+		<tt:SampleRate>48</tt:SampleRate>
+		<tt:Multicast>
+			<tt:Address><tt:Type>IPv4</tt:Type><tt:IPv4Address>0.0.0.0</tt:IPv4Address></tt:Address>
+			<tt:Port>0</tt:Port>
+			<tt:TTL>1</tt:TTL>
+			<tt:AutoStart>false</tt:AutoStart>
+		</tt:Multicast>
+		<tt:SessionTimeout>PT60S</tt:SessionTimeout>
+	</tt:%s>`, tag, tag)
+}
+
+func GetAudioSourcesResponse() []byte {
+	e := NewEnvelope()
+	e.Append(`<trt:GetAudioSourcesResponse>
+		<trt:AudioSources token="audio_source">
+			<tt:Channels>1</tt:Channels>
+		</trt:AudioSources>
+	</trt:GetAudioSourcesResponse>`)
+	return e.Bytes()
+}
+
+func GetAudioSourceConfigurationsResponse() []byte {
+	e := NewEnvelope()
+	e.Append(`<trt:GetAudioSourceConfigurationsResponse>`)
+	appendAudioSourceConfiguration(e, "Configurations")
+	e.Append(`</trt:GetAudioSourceConfigurationsResponse>`)
+	return e.Bytes()
+}
+
+func GetAudioEncoderConfigurationsResponse() []byte {
+	e := NewEnvelope()
+	e.Append(`<trt:GetAudioEncoderConfigurationsResponse>`)
+	appendAudioEncoderConfiguration(e, "Configurations")
+	e.Append(`</trt:GetAudioEncoderConfigurationsResponse>`)
+	return e.Bytes()
+}
+
+// GetAudioSourceConfigurationResponse — singular variant. ONVIF spec says
+// implementations SHOULD provide both singular and plural Get variants for
+// every Configuration type; we previously only provided the plural.
+func GetAudioSourceConfigurationResponse() []byte {
+	e := NewEnvelope()
+	e.Append(`<trt:GetAudioSourceConfigurationResponse>`)
+	appendAudioSourceConfiguration(e, "Configuration")
+	e.Append(`</trt:GetAudioSourceConfigurationResponse>`)
+	return e.Bytes()
+}
+
+// GetAudioEncoderConfigurationResponse — singular variant. See note above.
+func GetAudioEncoderConfigurationResponse() []byte {
+	e := NewEnvelope()
+	e.Append(`<trt:GetAudioEncoderConfigurationResponse>`)
+	appendAudioEncoderConfiguration(e, "Configuration")
+	e.Append(`</trt:GetAudioEncoderConfigurationResponse>`)
+	return e.Bytes()
+}
+
+// GetImagingServiceCapabilitiesResponse advertises a minimal imaging service
+// with no features enabled. UniFi, Frigate, and a few NVRs probe imaging
+// even on cameras that don't support it; returning a well-formed empty
+// capabilities document is friendlier than 4xx-ing the request.
+func GetImagingServiceCapabilitiesResponse() []byte {
+	e := NewEnvelope()
+	e.Append(`<timg:GetServiceCapabilitiesResponse>
+		<timg:Capabilities ImageStabilization="false" Presets="false" />
+	</timg:GetServiceCapabilitiesResponse>`)
+	return e.Bytes()
+}
+
+// GetImagingSettingsResponse returns an empty imaging settings document.
+// No image adjustments are supported.
+func GetImagingSettingsResponse() []byte {
+	e := NewEnvelope()
+	e.Append(`<timg:GetImagingSettingsResponse>
+		<timg:ImagingSettings />
+	</timg:GetImagingSettingsResponse>`)
+	return e.Bytes()
+}
+
+// GetImagingOptionsResponse returns an empty options set — no adjustable
+// imaging parameters offered.
+func GetImagingOptionsResponse() []byte {
+	e := NewEnvelope()
+	e.Append(`<timg:GetOptionsResponse>
+		<timg:ImagingOptions />
+	</timg:GetOptionsResponse>`)
+	return e.Bytes()
+}
+
+// GetImagingMoveOptionsResponse returns empty move options — no focus motor.
+func GetImagingMoveOptionsResponse() []byte {
+	e := NewEnvelope()
+	e.Append(`<timg:GetMoveOptionsResponse>
+		<timg:MoveOptions />
+	</timg:GetMoveOptionsResponse>`)
+	return e.Bytes()
+}
+
+// GetImagingStatusResponse returns a neutral status.
+func GetImagingStatusResponse() []byte {
+	e := NewEnvelope()
+	e.Append(`<timg:GetStatusResponse>
+		<timg:Status />
+	</timg:GetStatusResponse>`)
+	return e.Bytes()
+}
+
 func GetStreamUriResponse(uri string) []byte {
 	e := NewEnvelope()
 	e.Appendf(`<trt:GetStreamUriResponse><trt:MediaUri><tt:Uri>%s</tt:Uri></trt:MediaUri></trt:GetStreamUriResponse>`, uri)
@@ -251,6 +397,24 @@ func StaticResponse(operation string) []byte {
 		return GetVideoEncoderConfigurationResponse()
 	case MediaGetVideoEncoderConfigurations:
 		return GetVideoEncoderConfigurationsResponse()
+	case MediaGetAudioSources:
+		return GetAudioSourcesResponse()
+	case MediaGetAudioSourceConfiguration:
+		return GetAudioSourceConfigurationResponse()
+	case MediaGetAudioSourceConfigurations:
+		return GetAudioSourceConfigurationsResponse()
+	case MediaGetAudioEncoderConfiguration:
+		return GetAudioEncoderConfigurationResponse()
+	case MediaGetAudioEncoderConfigurations:
+		return GetAudioEncoderConfigurationsResponse()
+	case ImagingGetImagingSettings:
+		return GetImagingSettingsResponse()
+	case ImagingGetOptions:
+		return GetImagingOptionsResponse()
+	case ImagingGetMoveOptions:
+		return GetImagingMoveOptionsResponse()
+	case ImagingGetStatus:
+		return GetImagingStatusResponse()
 	}
 
 	e := NewEnvelope()
@@ -281,10 +445,6 @@ var responses = map[string]string{
 	<tds:Scopes><tt:ScopeDef>Fixed</tt:ScopeDef><tt:ScopeItem>onvif://www.onvif.org/Profile/Streaming</tt:ScopeItem></tds:Scopes>
 	<tds:Scopes><tt:ScopeDef>Fixed</tt:ScopeDef><tt:ScopeItem>onvif://www.onvif.org/type/Network_Video_Transmitter</tt:ScopeItem></tds:Scopes>
 </tds:GetScopesResponse>`,
-
-	MediaGetAudioEncoderConfigurations: `<trt:GetAudioEncoderConfigurationsResponse />`,
-	MediaGetAudioSources:               `<trt:GetAudioSourcesResponse />`,
-	MediaGetAudioSourceConfigurations:  `<trt:GetAudioSourceConfigurationsResponse />`,
 
 	MediaGetVideoEncoderConfigurationOptions: `<trt:GetVideoEncoderConfigurationOptionsResponse>
    <trt:Options>
