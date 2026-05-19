@@ -87,10 +87,34 @@ func NewConn(pc *webrtc.PeerConnection) *Conn {
 			}
 		}
 
-		if c.Mode == core.ModePassiveProducer && remote.Kind() == webrtc.RTPCodecTypeVideo {
+		// Send PLI (Picture Loss Indication) to request keyframes from the
+		// upstream WebRTC source. WebRTC SDP doesn't usually include
+		// sprop-parameter-sets, so downstream RTSP consumers can't decode
+		// anything until an IDR (carrying SPS/PPS inline) arrives. Without
+		// PLI requests, the upstream cadence is on the sender's schedule —
+		// typically 30-60s for live streams — which means new consumers see
+		// extended pixelation after a connection or restart.
+		//
+		// PassiveProducer (e.g. a browser broadcasting in): 2s — low cost,
+		// keeps tune-in latency tight for viewers.
+		// ActiveProducer (e.g. Nest, where go2rtc dials out to a cloud SFU):
+		// 10s — slower because keyframes cost WiFi airtime on the camera and
+		// upstream bandwidth on the SFU. Still fast enough that any consumer
+		// recovers from a restart within ~10s.
+		if remote.Kind() == webrtc.RTPCodecTypeVideo &&
+			(c.Mode == core.ModePassiveProducer || c.Mode == core.ModeActiveProducer) {
+			interval := time.Second * 2
+			if c.Mode == core.ModeActiveProducer {
+				interval = time.Second * 10
+			}
 			go func() {
 				pkts := []rtcp.Packet{&rtcp.PictureLossIndication{MediaSSRC: uint32(remote.SSRC())}}
-				for range time.NewTicker(time.Second * 2).C {
+				// Immediate PLI so cold-start tune-in doesn't have to wait
+				// for the first ticker fire.
+				if err := pc.WriteRTCP(pkts); err != nil {
+					return
+				}
+				for range time.NewTicker(interval).C {
 					if err := pc.WriteRTCP(pkts); err != nil {
 						return
 					}
