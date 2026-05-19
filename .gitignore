@@ -1,9 +1,11 @@
 .idea/
 .tmp/
+.claude/
 
 go2rtc.yaml
 go2rtc.json
 
+go2rtc-local.tar
 go2rtc_freebsd*
 go2rtc_linux*
 go2rtc_mac*
@@ -22,3 +24,4 @@ website/.vitepress/dist
 node_modules
 package-lock.json
 CLAUDE.md
+settings.json

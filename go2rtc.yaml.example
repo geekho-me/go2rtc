@@ -1,0 +1,13 @@
+log:
+  level: info
+
+rtsp:
+  default_query: "video&audio=aac"
+
+ffmpeg:
+  rtsp: "-fflags nobuffer+discardcorrupt -flags low_delay -err_detect ignore_err -timeout {timeout} -user_agent go2rtc/ffmpeg -rtsp_flags prefer_tcp -i {input}"
+
+streams:
+  driveway:
+    - nest:?client_id=...
+    - ffmpeg:driveway#audio=aac
