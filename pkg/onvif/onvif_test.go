@@ -5,6 +5,7 @@ import (
 	"net/url"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/stretchr/testify/require"
 )
@@ -222,6 +223,123 @@ func TestGetCapabilities(t *testing.T) {
 
 			rawURL = FindTagValue([]byte(test.xml), "Imaging.+?XAddr")
 			require.Equal(t, "http://192.168.1.123/onvif/imaging_service", rawURL)
+		})
+	}
+}
+
+// TestGetPosixTZ verifies the POSIX TZ string format that ONVIF
+// GetSystemDateAndTime responses use. POSIX TZ uses reversed sign
+// convention vs. ISO 8601: UTC-5 (EST) is written "EST5", UTC+9 (JST)
+// is written "JST-9". No colons in standard form; we permit a colon
+// for half-hour offsets only.
+func TestGetPosixTZ(t *testing.T) {
+	tests := []struct {
+		name string
+		zone *time.Location
+		want string
+	}{
+		{"UTC", time.UTC, "UTC0"},
+		{"EST west of UTC", time.FixedZone("EST", -5*3600), "EST5"},
+		{"JST east of UTC", time.FixedZone("JST", 9*3600), "JST-9"},
+		{"NST half-hour west", time.FixedZone("NST", -3*3600-1800), "NST3:30"},
+		{"IST half-hour east", time.FixedZone("IST", 5*3600+1800), "IST-5:30"},
+		{"empty zone name falls back to GMT", time.FixedZone("", -5*3600), "GMT5"},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			now := time.Now().In(tt.zone)
+			require.Equal(t, tt.want, GetPosixTZ(now))
+		})
+	}
+}
+
+// TestGetCapabilitiesResponse verifies all three ONVIF services
+// (Device, Media, Imaging) are advertised in the response.
+func TestGetCapabilitiesResponse(t *testing.T) {
+	out := string(GetCapabilitiesResponse("192.168.1.123:1984"))
+
+	require.Contains(t, out, "<tt:Device>")
+	require.Contains(t, out, "<tt:Media>")
+	require.Contains(t, out, "<tt:Imaging>")
+	require.Contains(t, out, "http://192.168.1.123:1984/onvif/device_service")
+	require.Contains(t, out, "http://192.168.1.123:1984/onvif/media_service")
+	require.Contains(t, out, "http://192.168.1.123:1984/onvif/imaging_service")
+	require.Contains(t, out, "<tt:RTP_RTSP_TCP>true</tt:RTP_RTSP_TCP>")
+}
+
+// TestGetServicesResponse verifies all three WSDL namespaces are
+// advertised in the response (Device, Media, Imaging).
+func TestGetServicesResponse(t *testing.T) {
+	out := string(GetServicesResponse("192.168.1.123:1984"))
+
+	require.Contains(t, out, "http://www.onvif.org/ver10/device/wsdl")
+	require.Contains(t, out, "http://www.onvif.org/ver10/media/wsdl")
+	require.Contains(t, out, "http://www.onvif.org/ver20/imaging/wsdl")
+	require.Contains(t, out, "http://192.168.1.123:1984/onvif/device_service")
+	require.Contains(t, out, "http://192.168.1.123:1984/onvif/media_service")
+	require.Contains(t, out, "http://192.168.1.123:1984/onvif/imaging_service")
+}
+
+// TestGetProfilesResponseIncludesAudio verifies appendProfile emits both
+// audio and video Source/Encoder Configuration blocks. The audio blocks
+// are essential for UniFi Protect 3rd-party adoption: without
+// AudioEncoderConfiguration in the profile, UniFi won't negotiate the
+// audio track during RTSP SETUP even if SDP advertises it.
+func TestGetProfilesResponseIncludesAudio(t *testing.T) {
+	out := string(GetProfilesResponse([]string{"driveway"}))
+
+	require.Contains(t, out, `token="driveway"`)
+	require.Contains(t, out, "<tt:VideoSourceConfiguration")
+	require.Contains(t, out, "<tt:VideoEncoderConfiguration")
+	require.Contains(t, out, "<tt:AudioSourceConfiguration")
+	require.Contains(t, out, "<tt:AudioEncoderConfiguration")
+	require.Contains(t, out, "<tt:Encoding>H264</tt:Encoding>")
+	require.Contains(t, out, "<tt:Encoding>AAC</tt:Encoding>")
+}
+
+// TestImagingResponses verifies the imaging service stub responses use
+// the timg: namespace and produce well-formed (if empty) configurations.
+// The namespace prefix must be declared on the envelope for clients to
+// parse them; the regression check is "do these strings appear together
+// in the same response".
+func TestImagingResponses(t *testing.T) {
+	tests := []struct {
+		name  string
+		body  []byte
+		inner string
+	}{
+		{"GetServiceCapabilities", GetImagingServiceCapabilitiesResponse(), "<timg:GetServiceCapabilitiesResponse>"},
+		{"GetImagingSettings", GetImagingSettingsResponse(), "<timg:GetImagingSettingsResponse>"},
+		{"GetOptions", GetImagingOptionsResponse(), "<timg:GetOptionsResponse>"},
+		{"GetMoveOptions", GetImagingMoveOptionsResponse(), "<timg:GetMoveOptionsResponse>"},
+		{"GetStatus", GetImagingStatusResponse(), "<timg:GetStatusResponse>"},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			out := string(tt.body)
+			require.Contains(t, out, tt.inner)
+			require.Contains(t, out, `xmlns:timg="http://www.onvif.org/ver20/imaging/wsdl"`)
+		})
+	}
+}
+
+// TestStaticResponseRoutesImagingOps verifies the operation-name
+// dispatcher in StaticResponse routes imaging operations to the
+// timg-namespaced response builders rather than falling through to
+// the empty-string default.
+func TestStaticResponseRoutesImagingOps(t *testing.T) {
+	for _, op := range []string{
+		ImagingGetImagingSettings,
+		ImagingGetOptions,
+		ImagingGetMoveOptions,
+		ImagingGetStatus,
+	} {
+		t.Run(op, func(t *testing.T) {
+			out := string(StaticResponse(op))
+			require.Contains(t, out, "<timg:")
+			require.Contains(t, out, op+"Response>")
 		})
 	}
 }

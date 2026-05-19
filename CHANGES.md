@@ -221,10 +221,38 @@ groups) and addresses a coherent area.
 
 ---
 
+## Test coverage
+
+Five new tests added in `pkg/onvif/onvif_test.go` covering the
+ONVIF server-side changes:
+
+- `TestGetPosixTZ` — pure-function test of the new POSIX TZ
+  formatter. Covers UTC, west/east-of-UTC standard offsets,
+  half-hour offsets (NST, IST), and the empty-zone-name fallback.
+  Uses `time.FixedZone()` so test results are deterministic
+  regardless of the host machine's TZ.
+- `TestGetCapabilitiesResponse` — verifies all three services
+  (Device, Media, Imaging) appear in the GetCapabilities response.
+- `TestGetServicesResponse` — verifies all three WSDL namespaces
+  and service URLs appear in the GetServices response.
+- `TestGetProfilesResponseIncludesAudio` — regression guard for
+  the AudioSourceConfiguration + AudioEncoderConfiguration blocks
+  in `appendProfile`. Without these, UniFi Protect won't negotiate
+  the audio track during RTSP SETUP.
+- `TestImagingResponses` + `TestStaticResponseRoutesImagingOps`
+  — verify imaging stubs use the `timg:` namespace and that the
+  operation-name dispatcher routes correctly.
+
+No new tests added for the other packages — RTSP / WebRTC / Nest
+changes either touch connection-level code that needs heavy mocking
+to exercise (PLI sending, GET_PARAMETER keepalives, Nest extension
+loop), or pure-state changes (session ID consistency, 501 response)
+that exercise via real-world integration testing. All existing
+tests in `pkg/onvif/onvif_test.go`, `pkg/rtsp/rtsp_test.go`,
+`pkg/rtsp/client_test.go` continue to pass.
+
 ## Build verification
 
 All changes compile under Go 1.25 with no new dependencies. Built and
 deployed continuously through the debugging session against the
 production go2rtc Docker image (`docker/Dockerfile`, multi-stage build).
-No new tests added — existing unit tests in `pkg/onvif/onvif_test.go`,
-`pkg/rtsp/rtsp_test.go`, and `pkg/rtsp/client_test.go` continue to pass.
