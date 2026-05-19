@@ -200,7 +200,12 @@ var log zerolog.Logger
 
 func middlewareLog(next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		log.Trace().Msgf("[api] %s %s %s", r.Method, r.URL, r.RemoteAddr)
+		log.Trace().
+			Str("method", r.Method).
+			Stringer("url", r.URL).
+			Str("remote", r.RemoteAddr).
+			Str("user_agent", r.Header.Get("User-Agent")).
+			Msg("[api] request")
 		next.ServeHTTP(w, r)
 	})
 }

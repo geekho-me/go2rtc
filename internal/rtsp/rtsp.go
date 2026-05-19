@@ -174,7 +174,11 @@ func tcpHandler(conn *rtsp.Conn) {
 				return
 			}
 
-			log.Debug().Str("stream", name).Msg("[rtsp] new consumer")
+			log.Debug().
+				Str("stream", name).
+				Str("remote", conn.Connection.RemoteAddr).
+				Str("user_agent", conn.UserAgent).
+				Msg("[rtsp] new consumer")
 
 			conn.SessionName = app.UserAgent
 
@@ -219,7 +223,10 @@ func tcpHandler(conn *rtsp.Conn) {
 			conn.Connection.Source = query.Get("source")
 
 			if err := stream.AddConsumer(conn); err != nil {
-				log.WithLevel(level).Err(err).Str("stream", name).Msg("[rtsp]")
+				log.WithLevel(level).Err(err).
+					Str("stream", name).
+					Str("remote", conn.Connection.RemoteAddr).
+					Msg("[rtsp]")
 				return
 			}
 
@@ -245,7 +252,11 @@ func tcpHandler(conn *rtsp.Conn) {
 				conn.Timeout = core.Atoi(s)
 			}
 
-			log.Debug().Str("stream", name).Msg("[rtsp] new producer")
+			log.Debug().
+				Str("stream", name).
+				Str("remote", conn.Connection.RemoteAddr).
+				Str("user_agent", conn.UserAgent).
+				Msg("[rtsp] new producer")
 
 			stream.AddProducer(conn)
 
@@ -276,12 +287,18 @@ func tcpHandler(conn *rtsp.Conn) {
 
 	if closer != nil {
 		if err := conn.Handle(); err != nil {
-			log.Debug().Err(err).Msg("[rtsp] handle")
+			log.Debug().Err(err).
+				Str("stream", name).
+				Str("remote", conn.Connection.RemoteAddr).
+				Msg("[rtsp] handle")
 		}
 
 		closer()
 
-		log.Debug().Str("stream", name).Msg("[rtsp] disconnect")
+		log.Debug().
+			Str("stream", name).
+			Str("remote", conn.Connection.RemoteAddr).
+			Msg("[rtsp] disconnect")
 	}
 
 	_ = conn.Close()

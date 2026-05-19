@@ -102,8 +102,12 @@ func initWS(origin string) {
 func apiWS(w http.ResponseWriter, r *http.Request) {
 	ws, err := wsUp.Upgrade(w, r, nil)
 	if err != nil {
-		origin := r.Header.Get("Origin")
-		log.Error().Err(err).Caller().Msgf("host=%s origin=%s", r.Host, origin)
+		log.Error().Err(err).
+			Str("host", r.Host).
+			Str("origin", r.Header.Get("Origin")).
+			Str("remote", r.RemoteAddr).
+			Str("user_agent", r.Header.Get("User-Agent")).
+			Msg("[api] ws upgrade")
 		return
 	}
 
@@ -128,7 +132,10 @@ func apiWS(w http.ResponseWriter, r *http.Request) {
 			break
 		}
 
-		log.Trace().Str("type", msg.Type).Msg("[api] ws msg")
+		log.Trace().
+			Str("type", msg.Type).
+			Str("remote", r.RemoteAddr).
+			Msg("[api] ws msg")
 
 		if handler := wsHandlers[msg.Type]; handler != nil {
 			go func() {

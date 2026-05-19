@@ -75,7 +75,12 @@ func handlerKeyframe(w http.ResponseWriter, r *http.Request) {
 }
 
 func handlerMP4(w http.ResponseWriter, r *http.Request) {
-	log.Trace().Msgf("[mp4] %s %+v", r.Method, r.Header)
+	log.Trace().
+		Str("method", r.Method).
+		Str("remote", r.RemoteAddr).
+		Str("user_agent", r.Header.Get("User-Agent")).
+		Stringer("url", r.URL).
+		Msg("[mp4] request")
 
 	query := r.URL.Query()
 
