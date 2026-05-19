@@ -54,15 +54,17 @@ type Conn struct {
 }
 
 const (
-	ProtoRTSP      = "RTSP/1.0"
-	MethodOptions  = "OPTIONS"
-	MethodSetup    = "SETUP"
-	MethodTeardown = "TEARDOWN"
-	MethodDescribe = "DESCRIBE"
-	MethodPlay     = "PLAY"
-	MethodPause    = "PAUSE"
-	MethodAnnounce = "ANNOUNCE"
-	MethodRecord   = "RECORD"
+	ProtoRTSP           = "RTSP/1.0"
+	MethodOptions       = "OPTIONS"
+	MethodSetup         = "SETUP"
+	MethodTeardown      = "TEARDOWN"
+	MethodDescribe      = "DESCRIBE"
+	MethodPlay          = "PLAY"
+	MethodPause         = "PAUSE"
+	MethodAnnounce      = "ANNOUNCE"
+	MethodRecord        = "RECORD"
+	MethodGetParameter  = "GET_PARAMETER"
+	MethodSetParameter  = "SET_PARAMETER"
 )
 
 type State byte
@@ -219,8 +221,29 @@ func (c *Conn) handleTCPData() error {
 				return err
 			}
 			c.Fire(req)
-			if req.Method == MethodOptions {
+			// Reply to in-stream RTSP requests that may arrive after PLAY.
+			// OPTIONS, GET_PARAMETER, SET_PARAMETER are commonly used as
+			// keepalives (UniFi Protect uses SET_PARAMETER every ~30s);
+			// TEARDOWN must be ACKed and the connection closed; PAUSE is
+			// acknowledged but we don't actually halt media flow (clients
+			// almost always TEARDOWN+SETUP instead). Other methods get
+			// 455 Method Not Valid In This State per RFC 2326 §11.4.
+			switch req.Method {
+			case MethodOptions, MethodGetParameter, MethodSetParameter, MethodPause:
 				res := &tcp.Response{Request: req}
+				if err = c.WriteResponse(res); err != nil {
+					return err
+				}
+			case MethodTeardown:
+				res := &tcp.Response{Request: req}
+				_ = c.WriteResponse(res)
+				c.state = StateNone
+				return c.conn.Close()
+			default:
+				res := &tcp.Response{
+					Status:  "455 Method Not Valid In This State",
+					Request: req,
+				}
 				if err = c.WriteResponse(res); err != nil {
 					return err
 				}

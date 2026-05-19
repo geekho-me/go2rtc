@@ -70,10 +70,21 @@ func (c *Conn) Accept() error {
 		case MethodOptions:
 			res := &tcp.Response{
 				Header: map[string][]string{
-					"Public": {"OPTIONS, SETUP, TEARDOWN, DESCRIBE, PLAY, PAUSE, ANNOUNCE, RECORD"},
+					"Public": {"OPTIONS, SETUP, TEARDOWN, DESCRIBE, PLAY, PAUSE, ANNOUNCE, RECORD, GET_PARAMETER, SET_PARAMETER"},
 				},
 				Request: req,
 			}
+			if err = c.WriteResponse(res); err != nil {
+				return err
+			}
+
+		case MethodGetParameter, MethodSetParameter:
+			// RFC 2326 §10.8/§10.9 — commonly used by clients (UniFi Protect,
+			// Axis, others) as a keepalive. Without a 200 OK response the
+			// client treats the session as dead and tears down the TCP
+			// connection, which manifests as periodic "lost connection"
+			// errors and visible decode artefacts on reconnect.
+			res := &tcp.Response{Request: req}
 			if err = c.WriteResponse(res); err != nil {
 				return err
 			}
@@ -166,7 +177,12 @@ func (c *Conn) Accept() error {
 			// Test if client requests TCP transport, otherwise return 461 Transport not supported
 			// This allows smart clients who initially requested UDP to fall back on TCP transport
 			if tr := req.Header.Get("Transport"); strings.HasPrefix(tr, "RTP/AVP/TCP") {
-				c.session = core.RandString(8, 10)
+				// RFC 2326 §10.4 — the session ID is generated on the FIRST
+				// SETUP and must remain the same across subsequent SETUPs
+				// for additional media tracks in the same client session.
+				if c.session == "" {
+					c.session = core.RandString(8, 10)
+				}
 				c.state = StateSetup
 
 				if c.mode == core.ModePassiveConsumer {
@@ -213,8 +229,32 @@ func (c *Conn) Accept() error {
 			c.state = StateNone
 			return c.conn.Close()
 
+		case MethodPause:
+			// RFC 2326 §10.6 — PAUSE is RECOMMENDED. We don't actually
+			// pause the underlying media flow (clients almost always use
+			// TEARDOWN+SETUP instead), but acknowledging avoids dropping
+			// the connection on clients that probe PAUSE during adoption.
+			res := &tcp.Response{Request: req}
+			if err = c.WriteResponse(res); err != nil {
+				return err
+			}
+
 		default:
-			return fmt.Errorf("unsupported method: %s", req.Method)
+			// RFC 2326 §11.4 — respond 501 Not Implemented for unrecognised
+			// methods rather than closing the TCP connection. Per §1.4 the
+			// RTSP control connection is persistent; closing it on every
+			// unknown method (vendor extensions, PAUSE, REDIRECT, etc.)
+			// triggers reconnect loops in spec-strict clients.
+			res := &tcp.Response{
+				Status: "501 Not Implemented",
+				Header: map[string][]string{
+					"Allow": {"OPTIONS, SETUP, TEARDOWN, DESCRIBE, PLAY, PAUSE, ANNOUNCE, RECORD, GET_PARAMETER, SET_PARAMETER"},
+				},
+				Request: req,
+			}
+			if err = c.WriteResponse(res); err != nil {
+				return err
+			}
 		}
 	}
 }
