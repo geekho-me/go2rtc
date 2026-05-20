@@ -130,6 +130,27 @@ primary client/source combination.
   reconnected and waited for Google's next scheduled keyframe. With the
   fix, cold-start recovery is typically <5s.
 
+### 8b. Silent-stream detection for ActiveProducer sources
+
+- **Files:** `pkg/webrtc/conn.go`
+- **Change:** Added a 10-second `SetReadDeadline()` on the
+  `TrackRemote.Read()` call in the OnTrack loop, applied only for
+  `ModeActiveProducer`. When the deadline fires, the peer connection
+  is closed, which triggers `OnConnectionStateChange` → standard
+  reconnect cascade. PassiveProducer (browser → go2rtc) keeps the
+  blocking-read behaviour because legitimate silence (user mute,
+  paused webcam) is common.
+- **Why:** Nest's cloud SFU occasionally stops sending RTP but keeps
+  the WebRTC peer connection technically alive (ICE keepalives still
+  flowing, no `Disconnected` state event from pion). Without an
+  explicit read deadline, `Read()` blocked indefinitely on silence —
+  go2rtc believed the source was healthy while downstream consumers
+  (audio ffmpeg, UniFi) timed out one by one. Recovery only happened
+  ~95 seconds later when pion's failure-detection timer maxed out and
+  fired the state change. With the deadline, recovery completes in
+  ~17 seconds (10s deadline + ~6s for Nest WebRTC re-establishment),
+  a 5-6x improvement in observed recording-gap duration.
+
 ---
 
 ## Nest Source

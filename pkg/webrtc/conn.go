@@ -122,10 +122,31 @@ func NewConn(pc *webrtc.PeerConnection) *Conn {
 			}()
 		}
 
+		// For ActiveProducer sources (e.g. Nest, where go2rtc dials out to
+		// a cloud SFU), set a read deadline so a silent upstream — SFU
+		// drops media but keeps the WebRTC peer connection technically open
+		// — is detected and surfaces as a connection error. Without this,
+		// pion's TrackRemote.Read() blocks indefinitely on silence and the
+		// producer never restarts, producing minutes-long recording gaps.
+		//
+		// Skipped for PassiveProducer (browser → go2rtc) because legitimate
+		// silence (user mute, paused webcam) is common and shouldn't force
+		// a disconnect.
+		useReadDeadline := c.Mode == core.ModeActiveProducer
+		const readDeadline = 10 * time.Second
+
 		for {
 			b := make([]byte, ReceiveMTU)
+			if useReadDeadline {
+				_ = remote.SetReadDeadline(time.Now().Add(readDeadline))
+			}
 			n, _, err := remote.Read(b)
 			if err != nil {
+				if useReadDeadline {
+					// Tear down the peer connection so OnConnectionStateChange
+					// fires and the producer enters its reconnect path.
+					_ = pc.Close()
+				}
 				return
 			}
 
