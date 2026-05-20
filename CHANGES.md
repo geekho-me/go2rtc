@@ -130,34 +130,25 @@ primary client/source combination.
   reconnected and waited for Google's next scheduled keyframe. With the
   fix, cold-start recovery is typically <5s.
 
-### 8b. Silent-stream detection for ActiveProducer video tracks
+### 8b. Silent-stream detection (REVERTED)
 
-- **Files:** `pkg/webrtc/conn.go`
-- **Change:** Added a 20-second `SetReadDeadline()` on the
-  `TrackRemote.Read()` call in the OnTrack loop, applied only for
-  `ModeActiveProducer` *and only on the video track*. When the
-  deadline fires, the peer connection is closed, which triggers
-  `OnConnectionStateChange` → standard reconnect cascade.
-- **Why:** Nest's cloud SFU occasionally stops sending RTP but keeps
-  the WebRTC peer connection technically alive (ICE keepalives still
-  flowing, no `Disconnected` state event from pion). Without an
-  explicit read deadline, `Read()` blocked indefinitely on silence —
-  go2rtc believed the source was healthy while downstream consumers
-  (audio ffmpeg, UniFi) timed out one by one. Recovery only happened
-  ~95 seconds later when pion's failure-detection timer maxed out and
-  fired the state change. With the deadline, recovery completes in
-  ~25 seconds (20s deadline + ~6s for Nest WebRTC re-establishment).
-- **Why video-only:** WebRTC Opus encoders commonly use DTX
-  (discontinuous transmission); legitimate room silence produces zero
-  audio packets. An initial implementation applied the deadline to
-  all tracks and incorrectly tore down the connection every time the
-  scene went acoustically quiet, killing the video stream that was
-  working fine. Video tracks have no equivalent legitimate-silence
-  scenario — with PLI requests every 10s (item 8 above), an IDR
-  should arrive every ~10s minimum.
-- **Why PassiveProducer is exempt:** browser-pushed sources may
-  legitimately go silent on both audio (mute) and video (camera off),
-  and forcing reconnect there would be wrong.
+An attempt to use `SetReadDeadline()` on `TrackRemote.Read()` to
+detect silent upstream Nest streams faster (replacing pion's ~95s
+failure detection with ~25s detection) was reverted. The faster
+detection paradoxically broke UniFi Protect: when go2rtc restarted
+the Nest source quickly, UniFi's RTSP session was still alive but
+holding the previous Nest WebRTC session's SPS/PPS values. New RTP
+frames arrived with new codec params that didn't match UniFi's
+decoder state, freezing the video until manual Protect restart.
+
+The original ~95s detection window allowed UniFi's own session
+timeout to fire first, so UniFi disconnected and reconnected with
+fresh SDP. Fast detection skipped that natural recovery path.
+
+Proper fix would force RTSP consumers to disconnect when the source
+restarts (so they reconnect with fresh SDP). Not implemented here —
+left as a follow-up. The original ~95s detection is acceptable
+given how infrequent these events are in practice.
 
 ---
 
