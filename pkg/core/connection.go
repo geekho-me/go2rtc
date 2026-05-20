@@ -56,6 +56,13 @@ func (c *Connection) GetMedias() []*Media {
 	return c.Medias
 }
 
+// GetRemoteAddr exposes RemoteAddr through a method so consumer types
+// embedding *Connection can be discovered via a small interface in the
+// streams package without an import cycle.
+func (c *Connection) GetRemoteAddr() string {
+	return c.RemoteAddr
+}
+
 func (c *Connection) GetTrack(media *Media, codec *Codec) (*Receiver, error) {
 	for _, receiver := range c.Receivers {
 		if receiver.Codec == codec {

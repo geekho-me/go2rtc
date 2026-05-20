@@ -10,6 +10,17 @@ import (
 	"github.com/AlexxIT/go2rtc/pkg/core"
 )
 
+// redactSourceURL returns a producer URL with the query string stripped,
+// suitable for log output. Source URLs like `nest:?client_id=…&client_secret=…`
+// or `rtsp://user:pass@host/stream?…` would otherwise leak credentials into
+// log output that may be shared during debugging.
+func redactSourceURL(rawURL string) string {
+	if i := strings.IndexAny(rawURL, "?#"); i >= 0 {
+		return rawURL[:i]
+	}
+	return rawURL
+}
+
 type state byte
 
 const (
@@ -34,6 +45,12 @@ type Producer struct {
 	state    state
 	mu       sync.Mutex
 	workerID int
+
+	// stream is a back-reference to the parent Stream, set by NewStream /
+	// AddProducer. nil for standalone producers created via NewProducer().
+	// Used after a successful reconnect to notify the stream that downstream
+	// consumers should disconnect — see Stream.kickConsumers.
+	stream *Stream
 }
 
 const SourceTemplate = "{input}"
@@ -149,7 +166,7 @@ func (p *Producer) start() {
 		return
 	}
 
-	log.Debug().Msgf("[streams] start producer url=%s", p.url)
+	log.Debug().Msgf("[streams] start producer url=%s", redactSourceURL(p.url))
 
 	p.state = stateStart
 	p.workerID++
@@ -167,7 +184,7 @@ func (p *Producer) worker(conn core.Producer, workerID int) {
 			return
 		}
 
-		log.Warn().Err(err).Str("url", p.url).Caller().Send()
+		log.Warn().Err(err).Str("url", redactSourceURL(p.url)).Caller().Send()
 	}
 
 	p.reconnect(workerID, 0)
@@ -178,11 +195,25 @@ func (p *Producer) reconnect(workerID, retry int) {
 	defer p.mu.Unlock()
 
 	if p.workerID != workerID {
-		log.Trace().Msgf("[streams] stop reconnect url=%s", p.url)
+		log.Trace().Msgf("[streams] stop reconnect url=%s", redactSourceURL(p.url))
 		return
 	}
 
-	log.Debug().Msgf("[streams] retry=%d to url=%s", retry, p.url)
+	// First retry of a cycle is operationally interesting — surface it at
+	// info so operators running at log.level=info see source-outage events
+	// without enabling debug. Retry 5 is the threshold at which we
+	// escalate to warn: by then the backoff has stretched to 5s/retry, so
+	// the source has been down for ~10s+ and isn't coming back quickly.
+	// Per-retry detail (`retry=N to url=…`) stays at debug to avoid noise.
+	switch retry {
+	case 0:
+		log.Info().Str("source", redactSourceURL(p.url)).
+			Msg("[streams] producer reconnecting")
+	case 5:
+		log.Warn().Str("source", redactSourceURL(p.url)).Int("retry", retry).
+			Msg("[streams] producer reconnect still failing")
+	}
+	log.Debug().Msgf("[streams] retry=%d to url=%s", retry, redactSourceURL(p.url))
 
 	conn, err := GetProducer(p.url)
 	if err != nil {
@@ -239,6 +270,24 @@ func (p *Producer) reconnect(workerID, retry int) {
 	// swap connections
 	p.conn = conn
 
+	// Recovery signal at info level so operators at log.level=info see the
+	// outage was resolved. Pairs with the info line at retry=0.
+	log.Info().Str("source", redactSourceURL(p.url)).
+		Msg("[streams] producer reconnected")
+
+	// Disconnect downstream consumers so they re-DESCRIBE and pick up the
+	// new source's SDP (codec parameters such as SPS/PPS often differ
+	// across WebRTC re-establishments — without this, consumers like UniFi
+	// Protect remain attached to a stale RTSP session and freeze on the
+	// incompatible bitstream). Done after the swap so when consumers
+	// reconnect, the new producer is already serving.
+	if p.stream != nil {
+		// Use the URL scheme + path only (drops query string) so source
+		// URLs that carry credentials in the query (nest:?client_secret=…,
+		// etc.) don't leak them into the log line.
+		go p.stream.kickConsumers("producer reconnect: " + redactSourceURL(p.url))
+	}
+
 	go p.worker(conn, workerID)
 }
 
@@ -257,7 +306,7 @@ func (p *Producer) stop() {
 		p.workerID++
 	}
 
-	log.Debug().Msgf("[streams] stop producer url=%s", p.url)
+	log.Debug().Msgf("[streams] stop producer url=%s", redactSourceURL(p.url))
 
 	if p.conn != nil {
 		_ = p.conn.Stop()

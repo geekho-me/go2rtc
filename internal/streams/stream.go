@@ -18,14 +18,15 @@ type Stream struct {
 func NewStream(source any) *Stream {
 	switch source := source.(type) {
 	case string:
-		return &Stream{
-			producers: []*Producer{NewProducer(source)},
-		}
+		s := &Stream{producers: []*Producer{NewProducer(source)}}
+		s.linkProducers()
+		return s
 	case []string:
 		s := new(Stream)
 		for _, str := range source {
 			s.producers = append(s.producers, NewProducer(str))
 		}
+		s.linkProducers()
 		return s
 	case []any:
 		s := new(Stream)
@@ -37,6 +38,7 @@ func NewStream(source any) *Stream {
 			}
 			s.producers = append(s.producers, NewProducer(str))
 		}
+		s.linkProducers()
 		return s
 	case map[string]any:
 		return NewStream(source["url"])
@@ -44,6 +46,15 @@ func NewStream(source any) *Stream {
 		return new(Stream)
 	default:
 		panic(core.Caller())
+	}
+}
+
+// linkProducers sets each Producer's stream back-reference. Required for
+// Producer.reconnect to be able to notify the parent Stream
+// (kickConsumers) after a successful reconnect.
+func (s *Stream) linkProducers() {
+	for _, p := range s.producers {
+		p.stream = s
 	}
 }
 
@@ -76,8 +87,62 @@ func (s *Stream) RemoveConsumer(cons core.Consumer) {
 	s.stopProducers()
 }
 
+// remoteAddrer is the interface implemented by consumers whose underlying
+// transport has a known remote address. Most go2rtc consumer types embed
+// *core.Connection, which provides GetRemoteAddr() via promoted method —
+// so this assertion succeeds for RTSP, WebRTC, etc.
+type remoteAddrer interface {
+	GetRemoteAddr() string
+}
+
+// kickConsumers disconnects all consumers attached to this stream.
+// Called after a Producer reconnect when downstream consumers may be
+// holding stale codec parameters (SPS/PPS) from the previous source
+// session. By calling Stop() on each consumer, their underlying
+// transports (e.g. RTSP TCP connections) close, prompting them to
+// reconnect and re-DESCRIBE with the new producer's SDP.
+//
+// Consumers are not removed from s.consumers here — the natural
+// close-path in each transport (e.g. tcpHandler in internal/rtsp)
+// calls RemoveConsumer when its handler loop exits, keeping the list
+// in sync.
+//
+// reason is logged for observability; pass something specific like
+// "producer reconnect: <scheme>".
+func (s *Stream) kickConsumers(reason string) {
+	s.mu.Lock()
+	consumers := make([]core.Consumer, len(s.consumers))
+	copy(consumers, s.consumers)
+	s.mu.Unlock()
+
+	if len(consumers) == 0 {
+		return
+	}
+
+	// Collect remote addresses for the log line so a single grep on the
+	// kick event tells you exactly which clients were notified.
+	remotes := make([]string, 0, len(consumers))
+	for _, cons := range consumers {
+		if r, ok := cons.(remoteAddrer); ok {
+			if addr := r.GetRemoteAddr(); addr != "" {
+				remotes = append(remotes, addr)
+			}
+		}
+	}
+
+	log.Debug().
+		Int("count", len(consumers)).
+		Strs("remotes", remotes).
+		Str("reason", reason).
+		Msg("[streams] kicking consumers")
+
+	for _, cons := range consumers {
+		_ = cons.Stop()
+	}
+}
+
 func (s *Stream) AddProducer(prod core.Producer) {
-	producer := &Producer{conn: prod, state: stateExternal, url: "external"}
+	producer := &Producer{conn: prod, state: stateExternal, url: "external", stream: s}
 	s.mu.Lock()
 	s.producers = append(s.producers, producer)
 	s.mu.Unlock()

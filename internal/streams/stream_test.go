@@ -2,11 +2,25 @@ package streams
 
 import (
 	"net/url"
+	"sync/atomic"
 	"testing"
 
 	"github.com/AlexxIT/go2rtc/pkg/core"
 	"github.com/stretchr/testify/require"
 )
+
+// mockConsumer is a minimal core.Consumer for testing kickConsumers.
+// It records how many times Stop() was called.
+type mockConsumer struct {
+	stops atomic.Int32
+}
+
+func (m *mockConsumer) GetMedias() []*core.Media                                { return nil }
+func (m *mockConsumer) AddTrack(*core.Media, *core.Codec, *core.Receiver) error { return nil }
+func (m *mockConsumer) Stop() error {
+	m.stops.Add(1)
+	return nil
+}
 
 func TestRecursion(t *testing.T) {
 	// create stream with some source
@@ -39,4 +53,95 @@ func TestTempate(t *testing.T) {
 
 	require.Equal(t, stream1, stream2)
 	require.Equal(t, "ffmpeg:rtsp://example.com#video=copy", stream1.producers[0].url)
+}
+
+// TestKickConsumers verifies that Stream.kickConsumers calls Stop()
+// exactly once on every attached consumer. This is the disconnect path
+// used after a Producer reconnects so downstream RTSP clients re-DESCRIBE
+// and pick up fresh codec parameters (SPS/PPS).
+func TestKickConsumers(t *testing.T) {
+	t.Run("no consumers - no-op, doesn't panic", func(t *testing.T) {
+		s := &Stream{}
+		s.kickConsumers("test")
+	})
+
+	t.Run("multiple consumers - all get Stop()", func(t *testing.T) {
+		s := &Stream{}
+		consumers := []*mockConsumer{{}, {}, {}}
+		for _, c := range consumers {
+			s.consumers = append(s.consumers, c)
+		}
+
+		s.kickConsumers("test reason")
+
+		for i, c := range consumers {
+			require.Equal(t, int32(1), c.stops.Load(),
+				"consumer %d should have Stop() called exactly once", i)
+		}
+	})
+
+	t.Run("kick doesn't remove consumers from list", func(t *testing.T) {
+		// kickConsumers only triggers Stop(); the actual list cleanup
+		// happens in RemoveConsumer when each consumer's transport
+		// handler exits naturally.
+		s := &Stream{}
+		s.consumers = append(s.consumers, &mockConsumer{}, &mockConsumer{})
+
+		s.kickConsumers("test")
+
+		require.Len(t, s.consumers, 2,
+			"kickConsumers should not modify s.consumers directly")
+	})
+}
+
+// TestRedactSourceURL verifies the helper used to scrub query strings
+// from source URLs before they appear in log lines. Producer URLs like
+// `nest:?client_id=…&client_secret=…` carry credentials that must not
+// leak when debugging output is shared.
+func TestRedactSourceURL(t *testing.T) {
+	tests := []struct {
+		in, want string
+	}{
+		{"nest:?client_id=abc&client_secret=xyz&refresh_token=tok", "nest:"},
+		{"rtsp://user:pass@host/stream?audio=copy", "rtsp://user:pass@host/stream"},
+		{"rtsp://192.168.1.10/stream", "rtsp://192.168.1.10/stream"},
+		{"ffmpeg:driveway#audio=aac", "ffmpeg:driveway"},
+		{"ffmpeg:driveway?something#audio=aac", "ffmpeg:driveway"},
+		{"", ""},
+	}
+	for _, tt := range tests {
+		t.Run(tt.in, func(t *testing.T) {
+			require.Equal(t, tt.want, redactSourceURL(tt.in))
+		})
+	}
+}
+
+// TestNewStreamLinksProducers verifies that NewStream sets the
+// Producer.stream back-reference, which is required for the
+// reconnect → kickConsumers wiring to work.
+func TestNewStreamLinksProducers(t *testing.T) {
+	t.Run("single string source", func(t *testing.T) {
+		s := NewStream("rtsp://example.com")
+		require.Len(t, s.producers, 1)
+		require.Same(t, s, s.producers[0].stream,
+			"producer.stream should point back to its parent Stream")
+	})
+
+	t.Run("multiple string sources", func(t *testing.T) {
+		s := NewStream([]string{"rtsp://a", "rtsp://b", "rtsp://c"})
+		require.Len(t, s.producers, 3)
+		for i, p := range s.producers {
+			require.Same(t, s, p.stream,
+				"producer %d stream back-ref not set", i)
+		}
+	})
+
+	t.Run("[]any sources", func(t *testing.T) {
+		s := NewStream([]any{"rtsp://a", "rtsp://b"})
+		require.Len(t, s.producers, 2)
+		for i, p := range s.producers {
+			require.Same(t, s, p.stream,
+				"producer %d stream back-ref not set", i)
+		}
+	})
 }

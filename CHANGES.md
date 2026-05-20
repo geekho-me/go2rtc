@@ -130,25 +130,91 @@ primary client/source combination.
   reconnected and waited for Google's next scheduled keyframe. With the
   fix, cold-start recovery is typically <5s.
 
-### 8b. Silent-stream detection (REVERTED)
+### 8b. Kick downstream consumers on Producer reconnect
 
-An attempt to use `SetReadDeadline()` on `TrackRemote.Read()` to
-detect silent upstream Nest streams faster (replacing pion's ~95s
-failure detection with ~25s detection) was reverted. The faster
-detection paradoxically broke UniFi Protect: when go2rtc restarted
-the Nest source quickly, UniFi's RTSP session was still alive but
-holding the previous Nest WebRTC session's SPS/PPS values. New RTP
-frames arrived with new codec params that didn't match UniFi's
-decoder state, freezing the video until manual Protect restart.
+- **Files:** `internal/streams/producer.go`, `internal/streams/stream.go`,
+  `internal/streams/play.go`, `internal/streams/stream_test.go`,
+  `pkg/core/connection.go`
+- **Change:** Added a `stream *Stream` back-reference to `Producer` so
+  it can notify its parent stream after a successful reconnect.
+  Stream gains a `kickConsumers(reason string)` method that snapshots
+  the consumer list, gathers the remote addresses via a small
+  `remoteAddrer` interface (satisfied by anything embedding
+  `*core.Connection`), and calls `Stop()` on each consumer. The
+  reconnect path in `Producer.reconnect()` invokes this (in a
+  goroutine to avoid holding the producer mutex during downstream
+  teardown). `core.Connection` gains a `GetRemoteAddr()` accessor
+  method that makes the address available via the interface without
+  introducing an import cycle.
+- **Why:** When a Producer (e.g. Nest WebRTC) reconnects, the new
+  source typically has different codec parameters (SPS/PPS in a fresh
+  WebRTC SDP). The existing `receiver.Replace(track)` swaps the
+  upstream track silently — downstream RTSP consumers (UniFi Protect)
+  keep their session alive but their decoder is configured for the
+  *previous* SDP. New RTP frames arrive with incompatible bitstream
+  parameters → frozen video until manual reconnect.
+  By kicking consumers on reconnect, they're forced to re-DESCRIBE
+  and pick up the new producer's SDP. The natural list cleanup happens
+  in each consumer's transport handler (e.g. `tcpHandler` in
+  `internal/rtsp` calls `RemoveConsumer` when its loop exits).
+- **Earlier failed attempt (now reverted):** A `SetReadDeadline()`-
+  based fast silence detection (commits 58f1495, 9a1ad59, 1254ea9)
+  tried to reduce the ~95s detection latency for terminal silences.
+  The 25s fast recovery paradoxically broke UniFi because it bypassed
+  the natural session-timeout recovery path that the 95s detection
+  relied on. The kick-consumers fix in this commit addresses the
+  underlying codec-refresh problem directly, so fast detection could
+  be safely re-introduced in a follow-up if desired.
+- **Test coverage:** `TestKickConsumers` (3 sub-tests: empty,
+  multiple, no list mutation), `TestNewStreamLinksProducers` (3
+  sub-tests: single string, []string, []any construction paths),
+  `TestRedactSourceURL` (6 sub-tests covering nest, rtsp with auth,
+  ffmpeg, fragment-only, empty). Uses a `mockConsumer` implementing
+  `core.Consumer` with an atomic Stop counter.
 
-The original ~95s detection window allowed UniFi's own session
-timeout to fire first, so UniFi disconnected and reconnected with
-fresh SDP. Fast detection skipped that natural recovery path.
+### 8c. Streams logging: info/warn levels + credential redaction
 
-Proper fix would force RTSP consumers to disconnect when the source
-restarts (so they reconnect with fresh SDP). Not implemented here —
-left as a follow-up. The original ~95s detection is acceptable
-given how infrequent these events are in practice.
+- **Files:** `internal/streams/producer.go`, `internal/streams/stream.go`
+- **Change (logging levels):** Source reconnect cycles are now
+  surfaced at multiple log levels for operational visibility:
+  - `INF [streams] producer reconnecting source=<scheme>:` fires once
+    at the start of a reconnect cycle (retry=0). Lets operators
+    running at `log.level=info` see source-outage events without
+    enabling debug.
+  - `WRN [streams] producer reconnect still failing source=… retry=5`
+    fires once when retries pass the 5-second-backoff threshold, so
+    persistent outages bubble up to warn-level without per-retry
+    noise.
+  - `INF [streams] producer reconnected source=…` fires after a
+    successful reconnect, pairing with the "reconnecting" line to
+    confirm recovery happened.
+  - Per-retry `[streams] retry=N to url=…` lines stay at debug to
+    avoid log volume when a source is flapping.
+- **Change (kick log):** The `[streams] kicking consumers` log line
+  now includes a `remotes=` array so a single grep on the kick event
+  tells you exactly which downstream clients were notified, no
+  cross-referencing with subsequent `[rtsp] disconnect` lines needed.
+- **Change (credential redaction):** Added a `redactSourceURL()`
+  helper that strips the URL query (and fragment) before logging.
+  Applied to all `p.url` occurrences in `internal/streams/producer.go`
+  (5 existing log calls plus the 3 new info/warn ones). Source URLs
+  like `nest:?client_id=…&client_secret=…&refresh_token=…` are now
+  logged as `nest:` only. Other credential-bearing schemes
+  (RTSP with `user:pass@host`) were already covered by
+  `pkg/creds.SecretWriter`'s `userinfoRegexp`; this fix closes the
+  query-string credential leak.
+- **Why:** The pre-fix logs printed full producer URLs at multiple
+  levels including warn. For Nest sources the URL carries OAuth
+  credentials in the query string — sharing any log file (e.g.
+  pasting into an issue tracker or chat) leaked the secret. With the
+  redaction, log lines stay useful for diagnosis (you can still see
+  the source scheme + path) but no credentials appear.
+- **Deliberately not redacted:** `[echo]` log of script output, `[expr]`
+  source URL, `[api] request` query strings, `[onvif]` SOAP bodies.
+  Each is either lower-risk (PasswordDigest is an HMAC, not plain
+  text) or has legitimate non-credential information that would be
+  lost by blunt redaction. Worth revisiting individually if a specific
+  use case requires it.
 
 ---
 
@@ -204,6 +270,21 @@ given how infrequent these events are in practice.
   tell which session was which. With the new fields, sessions are
   trivially greppable by `remote=192.168.5.1` or
   `user_agent=GStreamer/1.26.10`.
+
+### 11b. Warn on RTSP DESCRIBE / ANNOUNCE of unknown stream
+
+- **Files:** `internal/rtsp/rtsp.go`
+- **Change:** When an RTSP client requests a stream name that doesn't
+  exist in `streams.Get(name)`, the handler now logs a warn-level line
+  with stream name, remote address, and user-agent before returning.
+  Previously the request was rejected silently.
+- **Why:** Most common cause is a configuration mismatch — the client
+  (UniFi Protect, VLC, Frigate) is pointed at a stream name that
+  doesn't exist in the current go2rtc.yaml. Symptom from the client
+  side is "can't adopt" or "stream unavailable" with no go2rtc-side
+  signal to confirm. The warn line ("stream not found",
+  "stream not found (ANNOUNCE)") gives operators an immediate
+  pointer at the problem without enabling debug.
 
 ### 12. Structured logging across HTTP / WebSocket / ONVIF / MP4
 

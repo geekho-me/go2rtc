@@ -171,6 +171,16 @@ func tcpHandler(conn *rtsp.Conn) {
 
 			stream := streams.Get(name)
 			if stream == nil {
+				// Most common cause is a configuration mismatch: the client
+				// (UniFi Protect, VLC, Frigate, etc.) is configured to point
+				// at a stream name that no longer exists in go2rtc.yaml,
+				// or has a typo. Surfacing at warn so operators see it
+				// without enabling debug.
+				log.Warn().
+					Str("stream", name).
+					Str("remote", conn.Connection.RemoteAddr).
+					Str("user_agent", conn.UserAgent).
+					Msg("[rtsp] stream not found")
 				return
 			}
 
@@ -244,6 +254,11 @@ func tcpHandler(conn *rtsp.Conn) {
 
 			stream := streams.Get(name)
 			if stream == nil {
+				log.Warn().
+					Str("stream", name).
+					Str("remote", conn.Connection.RemoteAddr).
+					Str("user_agent", conn.UserAgent).
+					Msg("[rtsp] stream not found (ANNOUNCE)")
 				return
 			}
 
