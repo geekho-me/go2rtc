@@ -4,6 +4,7 @@ import (
 	"net/url"
 	"sync/atomic"
 	"testing"
+	"time"
 
 	"github.com/AlexxIT/go2rtc/pkg/core"
 	"github.com/stretchr/testify/require"
@@ -91,6 +92,36 @@ func TestKickConsumers(t *testing.T) {
 
 		require.Len(t, s.consumers, 2,
 			"kickConsumers should not modify s.consumers directly")
+	})
+
+	t.Run("grace period holds producers alive then releases", func(t *testing.T) {
+		// Shorten the grace period so the test runs fast. The contract
+		// being verified: pending counter is bumped synchronously by
+		// kickConsumers, then decremented after the grace window.
+		// stopProducers checks pending and short-circuits while it's
+		// non-zero, so producers stay alive during the window.
+		original := kickGracePeriod
+		kickGracePeriod = 50 * time.Millisecond
+		defer func() { kickGracePeriod = original }()
+
+		s := &Stream{}
+		s.consumers = append(s.consumers, &mockConsumer{})
+
+		require.Equal(t, int32(0), s.pending.Load(),
+			"pending should start at 0")
+
+		s.kickConsumers("test")
+
+		// Immediately after the kick, pending should be 1 — producers
+		// are protected from premature stopProducers.
+		require.Equal(t, int32(1), s.pending.Load(),
+			"pending should be 1 during grace period")
+
+		// After the grace window expires, pending returns to 0.
+		require.Eventually(t,
+			func() bool { return s.pending.Load() == 0 },
+			500*time.Millisecond, 10*time.Millisecond,
+			"pending should return to 0 after grace period")
 	})
 }
 

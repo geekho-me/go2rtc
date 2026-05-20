@@ -4,6 +4,7 @@ import (
 	"encoding/json"
 	"sync"
 	"sync/atomic"
+	"time"
 
 	"github.com/AlexxIT/go2rtc/pkg/core"
 )
@@ -95,6 +96,14 @@ type remoteAddrer interface {
 	GetRemoteAddr() string
 }
 
+// kickGracePeriod is how long producers are held alive after kickConsumers
+// fires so kicked clients (e.g. UniFi Protect) can reconnect without
+// hitting a cold producer that has to spin back up. 30s easily covers
+// UniFi's normal 1–3s reconnect window and tolerates cloud-API throttles
+// (Google's Nest API briefly rate-limits successive WebRTC re-establishes).
+// Exposed as a package variable so tests can shorten it.
+var kickGracePeriod = 30 * time.Second
+
 // kickConsumers disconnects all consumers attached to this stream.
 // Called after a Producer reconnect when downstream consumers may be
 // holding stale codec parameters (SPS/PPS) from the previous source
@@ -106,6 +115,15 @@ type remoteAddrer interface {
 // close-path in each transport (e.g. tcpHandler in internal/rtsp)
 // calls RemoveConsumer when its handler loop exits, keeping the list
 // in sync.
+//
+// To keep producers alive during the reconnect window, this method
+// bumps s.pending for kickGracePeriod. While pending is non-zero,
+// stopProducers() short-circuits — so the producers we just
+// reconnected stay attached and ready for the kicked consumers'
+// near-immediate re-DESCRIBE. Without this, the cascade is
+// kick → consumers gone → producers stop (no senders) → consumer
+// reconnects to a cold producer → cold-start latency → consumer
+// timeout, back-off cycle.
 //
 // reason is logged for observability; pass something specific like
 // "producer reconnect: <scheme>".
@@ -135,6 +153,14 @@ func (s *Stream) kickConsumers(reason string) {
 		Strs("remotes", remotes).
 		Str("reason", reason).
 		Msg("[streams] kicking consumers")
+
+	// Hold producers alive during the grace window. See kickGracePeriod.
+	s.pending.Add(1)
+	time.AfterFunc(kickGracePeriod, func() {
+		if s.pending.Add(-1) == 0 {
+			s.stopProducers()
+		}
+	})
 
 	for _, cons := range consumers {
 		_ = cons.Stop()

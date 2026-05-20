@@ -175,6 +175,18 @@ as the primary client/source combination.
   and pick up the new producer's SDP. The natural list cleanup happens
   in each consumer's transport handler (e.g. `tcpHandler` in
   `internal/rtsp` calls `RemoveConsumer` when its loop exits).
+- **Grace period:** When the last consumer disconnects (which happens
+  cascade-style during a kick), `stopProducers()` would normally tear
+  down the producer we just reconnected — and a slow reconnect from
+  the kicked client would then have to wait for a fresh cold-start of
+  the producer (~6s for Nest WebRTC), often timing out and entering
+  a long back-off cycle (observed 7-minute recording gaps).
+  To prevent this, `kickConsumers()` bumps the `s.pending` counter
+  for a 30-second grace window — long enough for typical UniFi
+  reconnect (1–3s) plus margin for cloud-API throttling on
+  successive Nest WebRTC re-establishments. `stopProducers()` already
+  short-circuits when `pending > 0`, so the producer stays warm and
+  the reconnecting client lands cleanly on it.
 - **Earlier failed attempt (now reverted):** A `SetReadDeadline()`-
   based fast silence detection (commits 58f1495, 9a1ad59, 1254ea9)
   tried to reduce the ~95s detection latency for terminal silences.
@@ -183,8 +195,9 @@ as the primary client/source combination.
   relied on. The kick-consumers fix in this commit addresses the
   underlying codec-refresh problem directly, so fast detection could
   be safely re-introduced in a follow-up if desired.
-- **Test coverage:** `TestKickConsumers` (3 sub-tests: empty,
-  multiple, no list mutation), `TestNewStreamLinksProducers` (3
+- **Test coverage:** `TestKickConsumers` (4 sub-tests: empty,
+  multiple, no list mutation, grace-period pending bump/release),
+  `TestNewStreamLinksProducers` (3
   sub-tests: single string, []string, []any construction paths),
   `TestRedactSourceURL` (6 sub-tests covering nest, rtsp with auth,
   ffmpeg, fragment-only, empty). Uses a `mockConsumer` implementing
