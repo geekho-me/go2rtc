@@ -123,17 +123,28 @@ func NewConn(pc *webrtc.PeerConnection) *Conn {
 		}
 
 		// For ActiveProducer sources (e.g. Nest, where go2rtc dials out to
-		// a cloud SFU), set a read deadline so a silent upstream — SFU
-		// drops media but keeps the WebRTC peer connection technically open
-		// — is detected and surfaces as a connection error. Without this,
-		// pion's TrackRemote.Read() blocks indefinitely on silence and the
-		// producer never restarts, producing minutes-long recording gaps.
+		// a cloud SFU), set a read deadline on the VIDEO track so a silent
+		// upstream — SFU drops media but keeps the WebRTC peer connection
+		// technically open — is detected and surfaces as a connection
+		// error. Without this, pion's TrackRemote.Read() blocks indefinitely
+		// on silence and the producer never restarts.
 		//
-		// Skipped for PassiveProducer (browser → go2rtc) because legitimate
-		// silence (user mute, paused webcam) is common and shouldn't force
-		// a disconnect.
-		useReadDeadline := c.Mode == core.ModeActiveProducer
-		const readDeadline = 10 * time.Second
+		// Audio tracks are deliberately exempt: WebRTC Opus encoders
+		// commonly use DTX (discontinuous transmission), so legitimate
+		// silence in the room produces no audio packets at all. Applying a
+		// deadline to audio tracks would tear down the peer connection
+		// every time the scene went acoustically quiet, killing the video
+		// stream that was working fine.
+		//
+		// Skipped entirely for PassiveProducer (browser → go2rtc) because
+		// inbound silence (user mute, paused webcam) is also common there.
+		//
+		// 20s gives enough margin for PLI/IDR roundtrips (PLI ticker is
+		// 10s) while still catching terminal silences within ~25s
+		// end-to-end recovery.
+		useReadDeadline := c.Mode == core.ModeActiveProducer &&
+			remote.Kind() == webrtc.RTPCodecTypeVideo
+		const readDeadline = 20 * time.Second
 
 		for {
 			b := make([]byte, ReceiveMTU)

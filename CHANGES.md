@@ -130,16 +130,14 @@ primary client/source combination.
   reconnected and waited for Google's next scheduled keyframe. With the
   fix, cold-start recovery is typically <5s.
 
-### 8b. Silent-stream detection for ActiveProducer sources
+### 8b. Silent-stream detection for ActiveProducer video tracks
 
 - **Files:** `pkg/webrtc/conn.go`
-- **Change:** Added a 10-second `SetReadDeadline()` on the
+- **Change:** Added a 20-second `SetReadDeadline()` on the
   `TrackRemote.Read()` call in the OnTrack loop, applied only for
-  `ModeActiveProducer`. When the deadline fires, the peer connection
-  is closed, which triggers `OnConnectionStateChange` → standard
-  reconnect cascade. PassiveProducer (browser → go2rtc) keeps the
-  blocking-read behaviour because legitimate silence (user mute,
-  paused webcam) is common.
+  `ModeActiveProducer` *and only on the video track*. When the
+  deadline fires, the peer connection is closed, which triggers
+  `OnConnectionStateChange` → standard reconnect cascade.
 - **Why:** Nest's cloud SFU occasionally stops sending RTP but keeps
   the WebRTC peer connection technically alive (ICE keepalives still
   flowing, no `Disconnected` state event from pion). Without an
@@ -148,8 +146,18 @@ primary client/source combination.
   (audio ffmpeg, UniFi) timed out one by one. Recovery only happened
   ~95 seconds later when pion's failure-detection timer maxed out and
   fired the state change. With the deadline, recovery completes in
-  ~17 seconds (10s deadline + ~6s for Nest WebRTC re-establishment),
-  a 5-6x improvement in observed recording-gap duration.
+  ~25 seconds (20s deadline + ~6s for Nest WebRTC re-establishment).
+- **Why video-only:** WebRTC Opus encoders commonly use DTX
+  (discontinuous transmission); legitimate room silence produces zero
+  audio packets. An initial implementation applied the deadline to
+  all tracks and incorrectly tore down the connection every time the
+  scene went acoustically quiet, killing the video stream that was
+  working fine. Video tracks have no equivalent legitimate-silence
+  scenario — with PLI requests every 10s (item 8 above), an IDR
+  should arrive every ~10s minimum.
+- **Why PassiveProducer is exempt:** browser-pushed sources may
+  legitimately go silent on both audio (mute) and video (camera off),
+  and forcing reconnect there would be wrong.
 
 ---
 
