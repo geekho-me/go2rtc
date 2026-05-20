@@ -1,12 +1,30 @@
 # Local Changes
 
-Fork-local fixes against upstream `AlexxIT/go2rtc` from this debugging session.
-All changes target compliance with the underlying protocols (RFC 2326 for
-RTSP, ONVIF Profile S, Google Nest Device Access API) and observability
-improvements. Each item is independently revertable.
+This fork's changes focus on **improving the reliability of the
+Nest → go2rtc → UniFi Protect pipeline**. Out of the box, that
+end-to-end path has several latent problems: UniFi adoption doesn't
+negotiate audio, RTSP keepalive methods aren't acknowledged so
+sessions die every ~30 seconds, the Nest stream extension is
+fire-once so the stream silently dies at ~10 minutes, and when the
+upstream Nest source reconnects, downstream UniFi consumers get stuck
+on stale codec parameters and freeze until manual restart.
 
-Tested against UniFi Protect 7.1.60 + Google Nest (wired+WiFi) as the
-primary client/source combination.
+The patches in this file address each of those layers — ONVIF profile
+contents, RTSP method handling (RFC 2326 compliance), Nest stream
+extension lifecycle, WebRTC keyframe requests, and consumer-refresh
+on source reconnect — along with observability improvements
+(structured logs with remote IP / User-Agent, info/warn levels for
+source-outage events, credential redaction of source URLs in log
+output).
+
+The fixes are general-purpose: they help any RFC-2326 RTSP client
+talking to go2rtc (UniFi, Frigate, Synology Surveillance, Axis, etc.)
+and any go2rtc Nest source, not just the Nest+UniFi combination that
+exposed them.
+
+Each item below is independently revertable. Tested against
+UniFi Protect 7.1.60 + Google Nest (wired ethernet + WiFi cam) as
+the primary client/source combination.
 
 ---
 
@@ -303,22 +321,6 @@ primary client/source combination.
 - **Why:** Consistent observability across all client-facing surfaces.
   Same grep patterns work for any client interaction regardless of
   protocol.
-
----
-
-## Suggested upstream PR grouping
-
-If contributing back to AlexxIT/go2rtc, these changes group naturally
-into five focused PRs:
-
-1. **ONVIF improvements** — items 1, 2, 3, 4
-2. **RTSP compliance + keepalives** — items 5, 6, 7
-3. **Nest source robustness** — items 9, 10
-4. **WebRTC PLI for active producers** — item 8
-5. **Observability** — items 11, 12
-
-Each PR is independent of the others (no cross-dependencies between
-groups) and addresses a coherent area.
 
 ---
 
