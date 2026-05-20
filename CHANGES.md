@@ -23,8 +23,8 @@ and any go2rtc Nest source, not just the Nest+UniFi combination that
 exposed them.
 
 Each item below is independently revertable. Tested against
-UniFi Protect 7.1.60 + Google Nest (wired ethernet + WiFi cam) as
-the primary client/source combination.
+UniFi Protect 7.1.60 + [Google Nest Battery Camera](https://store.google.com/gb/product/nest_cam_battery?hl=en-GB)
+as the primary client/source combination.
 
 ---
 
