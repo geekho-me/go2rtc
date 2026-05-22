@@ -3,12 +3,39 @@ package streams
 import (
 	"encoding/json"
 	"errors"
+	"os"
 	"strings"
 	"sync"
 	"time"
 
 	"github.com/AlexxIT/go2rtc/pkg/core"
 )
+
+// kickOnReconnect controls whether downstream consumers are forcibly
+// disconnected after a Producer reconnects. Default: disabled.
+//
+// Background: the kick was added to refresh stale codec parameters
+// (SPS/PPS) on RTSP clients like UniFi Protect after a WebRTC
+// re-establishment produced new SDP. Empirically, UniFi Protect
+// versions through ≤ 7.0.x re-DESCRIBE within 1-3s of an abrupt
+// server-initiated TCP close, so the kick was a successful repair.
+//
+// UniFi Protect 7.1.69 changed behavior: after a server-initiated
+// close, the recording session does NOT re-establish (observed:
+// zero RTSP DESCRIBE attempts in the entire 2-minute grace window
+// even though the snapshot poll continued to succeed against the
+// same server). For those clients the kick is now actively
+// harmful — it permanently severs the recording session that the
+// reconnect was meant to refresh.
+//
+// Default-off because modern decoders (UniFi's GStreamer 1.26+
+// included) generally handle in-band SPS/PPS changes via RTP, so
+// the kick is unnecessary for them.
+//
+// Set GO2RTC_KICK_ON_RECONNECT=true to re-enable the legacy
+// behavior — appropriate for older UniFi versions or other RTSP
+// clients that genuinely cannot handle in-band parameter changes.
+var kickOnReconnect = os.Getenv("GO2RTC_KICK_ON_RECONNECT") == "true"
 
 // redactSourceURL returns a producer URL with the query string stripped,
 // suitable for log output. Source URLs like `nest:?client_id=…&client_secret=…`
@@ -171,7 +198,133 @@ func (p *Producer) start() {
 	p.state = stateStart
 	p.workerID++
 
+	// If the underlying producer declares a known max stream lifetime
+	// (e.g. nest WebRTC, ~60 min cap), wire up the proactive-reconnect
+	// callback so it can trigger a connection swap before the limit
+	// silently kills the stream. Logged at debug so operators can
+	// confirm the wiring is in place without waiting ~55 min for the
+	// first fire — a silent type-assertion failure would otherwise
+	// only surface as a re-emergence of the periodic gap.
+	if hook, ok := p.conn.(core.LifetimeLimited); ok {
+		hook.SetReconnectCallback(p.proactiveReconnect)
+		log.Debug().Str("source", redactSourceURL(p.url)).
+			Msg("[streams] proactive-reconnect hook registered (source declares max stream lifetime)")
+	}
+
 	go p.worker(p.conn, p.workerID)
+	go p.activityTick(p.workerID)
+}
+
+// proactiveReconnect triggers a fresh GetProducer + track swap without
+// waiting for the current connection to die. Invoked via the
+// SetReconnectCallback hook by producers that know their upstream has
+// a hard lifetime cap (currently: Nest WebRTC at ~60 min).
+//
+// The existing reconnect() flow is already overlap-friendly: it
+// allocates a new conn, moves tracks via Receiver.Replace(), then
+// stops the old conn. The only gap consumers see is the
+// GetProducer setup time (~3 s for Nest), and only on the receiver
+// tracks that haven't started flowing through the new conn yet.
+// That's small enough that UniFi's session-keepalive sees no
+// disruption.
+//
+// workerID bookkeeping: bump before reconnect so the old worker —
+// which will return shortly after reconnect calls p.conn.Stop() on
+// its conn — sees a workerID mismatch in its post-Start reconnect
+// call and no-ops. Without this, the old worker would race the new
+// one into reconnect() and produce a second fresh connection.
+func (p *Producer) proactiveReconnect() {
+	p.mu.Lock()
+	if p.state != stateStart {
+		p.mu.Unlock()
+		log.Trace().Str("source", redactSourceURL(p.url)).
+			Msg("[streams] skip proactive reconnect: producer not started")
+		return
+	}
+	p.workerID++
+	newID := p.workerID
+	p.mu.Unlock()
+
+	log.Info().Str("source", redactSourceURL(p.url)).
+		Msg("[streams] proactive reconnect (lifetime-limited source)")
+
+	// The activityTick goroutine started in start() is tied to the
+	// previous workerID and will exit on its next tick when it sees the
+	// bump. Spawn a fresh one with the new ID so heartbeats keep
+	// flowing through the new connection's lifetime — without this we
+	// lose visibility into the producer immediately after the refresh,
+	// which is the worst possible moment to go blind.
+	go p.activityTick(newID)
+
+	p.reconnect(newID, 0)
+}
+
+// activityInterval is the heartbeat cadence for the producer activity
+// log. Each tick emits one debug line per receiver with packets/bytes
+// deltas — visible only when --log.level=debug. The point is to make
+// silent-stall failure modes obvious: if the upstream connection looks
+// healthy (no EOF, no read-deadline fire) but video frames have stopped,
+// the heartbeat shows dpackets=0 on the affected track while audio
+// continues to tick over. Without this, those stalls are invisible
+// because routine RTP forwarding does not log per packet.
+//
+// Exposed as a package variable so tests can shorten it.
+var activityInterval = 60 * time.Second
+
+// activityTick periodically logs per-receiver packet and byte counts
+// for this producer. Runs in its own goroutine; exits when the
+// producer's workerID advances (start of next cycle or stop).
+//
+// Reconnect does not advance workerID, so the goroutine survives a
+// reconnect. Receivers are swapped via Receiver.Replace() in
+// p.reconnect(), which means after reconnect the slots in p.receivers
+// point at fresh *core.Receiver values whose counters start at 0. The
+// prev map is keyed by pointer, so a freshly-swapped receiver gets a
+// zero baseline on its first tick after reconnect — yielding a delta
+// equal to the new receiver's lifetime packet count. That's an
+// acceptable boundary blip; subsequent ticks are accurate deltas.
+func (p *Producer) activityTick(workerID int) {
+	ticker := time.NewTicker(activityInterval)
+	defer ticker.Stop()
+
+	type counter struct{ bytes, packets int }
+	prev := make(map[*core.Receiver]counter)
+
+	for range ticker.C {
+		p.mu.Lock()
+		if p.workerID != workerID {
+			p.mu.Unlock()
+			return
+		}
+		// Snapshot under lock — reconnect may swap p.receivers.
+		receivers := make([]*core.Receiver, len(p.receivers))
+		copy(receivers, p.receivers)
+		url := p.url
+		p.mu.Unlock()
+
+		if !log.Debug().Enabled() {
+			continue
+		}
+
+		for i, r := range receivers {
+			c := prev[r]
+			bytesNow, packetsNow := r.Bytes, r.Packets
+			prev[r] = counter{bytes: bytesNow, packets: packetsNow}
+
+			codec := "unknown"
+			if r.Codec != nil {
+				codec = r.Codec.Name
+			}
+			log.Debug().
+				Str("source", redactSourceURL(url)).
+				Int("track", i).
+				Str("codec", codec).
+				Int("dpackets", packetsNow-c.packets).
+				Int("dbytes", bytesNow-c.bytes).
+				Int("total_packets", packetsNow).
+				Msg("[streams] producer activity")
+		}
+	}
 }
 
 func (p *Producer) worker(conn core.Producer, workerID int) {
@@ -270,18 +423,27 @@ func (p *Producer) reconnect(workerID, retry int) {
 	// swap connections
 	p.conn = conn
 
+	// Re-register the proactive-reconnect callback on the new conn so
+	// the next lifetime cycle is also caught. Without this, only the
+	// first connection (from start()) benefits from proactive refresh.
+	if hook, ok := conn.(core.LifetimeLimited); ok {
+		hook.SetReconnectCallback(p.proactiveReconnect)
+		log.Debug().Str("source", redactSourceURL(p.url)).
+			Msg("[streams] proactive-reconnect hook re-registered after swap")
+	}
+
 	// Recovery signal at info level so operators at log.level=info see the
 	// outage was resolved. Pairs with the info line at retry=0.
 	log.Info().Str("source", redactSourceURL(p.url)).
 		Msg("[streams] producer reconnected")
 
 	// Disconnect downstream consumers so they re-DESCRIBE and pick up the
-	// new source's SDP (codec parameters such as SPS/PPS often differ
-	// across WebRTC re-establishments — without this, consumers like UniFi
-	// Protect remain attached to a stale RTSP session and freeze on the
-	// incompatible bitstream). Done after the swap so when consumers
-	// reconnect, the new producer is already serving.
-	if p.stream != nil {
+	// new source's SDP. Gated by kickOnReconnect because UniFi Protect
+	// 7.1.69+ does not re-DESCRIBE after a server-initiated close, so
+	// the kick now severs the recording session it was meant to repair.
+	// See the package-level comment on kickOnReconnect for the full
+	// rationale. Default behavior: no kick.
+	if p.stream != nil && kickOnReconnect {
 		// Use the URL scheme + path only (drops query string) so source
 		// URLs that carry credentials in the query (nest:?client_secret=…,
 		// etc.) don't leak them into the log line.

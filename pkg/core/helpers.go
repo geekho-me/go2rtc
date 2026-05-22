@@ -92,3 +92,40 @@ func Caller() string {
 	_, file, line, _ := runtime.Caller(1)
 	return file + ":" + strconv.Itoa(line)
 }
+
+// StripUserinfo redacts the userinfo (username:password) portion of any
+// rtsp:// or http:// URL embedded in the given string. The URL host,
+// path, and query are preserved unchanged. Intended for sanitising
+// streams.yaml content before it appears in logs or shared bug reports.
+//
+// Only the userinfo immediately preceding a scheme://host boundary is
+// replaced, so a literal "@" inside a path or query (e.g.
+// "rtsp://10.1.2.3:554/stream1@#video=copy") is left intact.
+func StripUserinfo(s string) string {
+	const placeholder = "***"
+	var b strings.Builder
+	b.Grow(len(s))
+	for {
+		i := strings.Index(s, "://")
+		if i < 0 {
+			b.WriteString(s)
+			return b.String()
+		}
+		b.WriteString(s[:i+3])
+		s = s[i+3:]
+		// Find the next userinfo terminator before the host ends. The
+		// host ends at '/', '?', '#', whitespace, or end-of-string.
+		end := len(s)
+		for j, ch := range s {
+			if ch == '/' || ch == '?' || ch == '#' || ch == ' ' || ch == '\n' || ch == '\r' || ch == '\t' {
+				end = j
+				break
+			}
+		}
+		if at := strings.LastIndex(s[:end], "@"); at >= 0 {
+			b.WriteString(placeholder)
+			b.WriteByte('@')
+			s = s[at+1:]
+		}
+	}
+}

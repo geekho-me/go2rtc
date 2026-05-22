@@ -1,6 +1,7 @@
 package streams
 
 import (
+	"net/http"
 	"net/url"
 	"sync/atomic"
 	"testing"
@@ -22,6 +23,23 @@ func (m *mockConsumer) Stop() error {
 	m.stops.Add(1)
 	return nil
 }
+
+// mockInternalConsumer is a mockConsumer that reports a source URL.
+// Models the inner ffmpeg subprocess of a recursive pipeline like
+// `ffmpeg:driveway` (subprocess reads rtsp://localhost/driveway and
+// is registered as a consumer of the same stream).
+type mockInternalConsumer struct {
+	mockConsumer
+	source string
+}
+
+// Satisfy core.Info — we only need GetSource for the kick-skip check.
+func (m *mockInternalConsumer) SetProtocol(string)             {}
+func (m *mockInternalConsumer) SetRemoteAddr(string)           {}
+func (m *mockInternalConsumer) SetSource(string)               {}
+func (m *mockInternalConsumer) SetURL(string)                  {}
+func (m *mockInternalConsumer) WithRequest(*http.Request)      {}
+func (m *mockInternalConsumer) GetSource() string              { return m.source }
 
 func TestRecursion(t *testing.T) {
 	// create stream with some source
@@ -92,6 +110,50 @@ func TestKickConsumers(t *testing.T) {
 
 		require.Len(t, s.consumers, 2,
 			"kickConsumers should not modify s.consumers directly")
+	})
+
+	t.Run("internal-loop consumer is skipped (no infinite reconnect)", func(t *testing.T) {
+		// Regression test for the recursive-pipeline reconnect loop:
+		//
+		//   ffmpeg:driveway producer
+		//     -> ffmpeg subprocess (registers as consumer of driveway)
+		//     -> kick called on producer reconnect
+		//     -> kicks the inner ffmpeg subprocess (its own source)
+		//     -> subprocess exits -> producer EOFs -> reconnect cycle
+		//
+		// Fix: consumers whose GetSource() matches one of this stream's
+		// producer URLs are exempt from the kick.
+		s := &Stream{
+			producers: []*Producer{
+				{url: "nest:?client_id=…"},
+				{url: "ffmpeg:driveway"},
+			},
+		}
+		external := &mockConsumer{} // UniFi-style consumer
+		internal := &mockInternalConsumer{source: "ffmpeg:driveway"}
+		s.consumers = append(s.consumers, external, internal)
+
+		s.kickConsumers("test")
+
+		require.Equal(t, int32(1), external.stops.Load(),
+			"external consumer should be kicked")
+		require.Equal(t, int32(0), internal.mockConsumer.stops.Load(),
+			"internal-loop consumer must NOT be kicked")
+	})
+
+	t.Run("grace period not held when only internal consumers", func(t *testing.T) {
+		// If every consumer is filtered out as internal, no kick happens
+		// and we should not bump pending unnecessarily.
+		s := &Stream{
+			producers: []*Producer{{url: "ffmpeg:driveway"}},
+		}
+		internal := &mockInternalConsumer{source: "ffmpeg:driveway"}
+		s.consumers = append(s.consumers, internal)
+
+		s.kickConsumers("test")
+
+		require.Equal(t, int32(0), s.pending.Load(),
+			"pending should not be bumped when no consumers are kicked")
 	})
 
 	t.Run("grace period holds producers alive then releases", func(t *testing.T) {

@@ -83,7 +83,16 @@ func (s *Stream) RemoveConsumer(cons core.Consumer) {
 			break
 		}
 	}
+	remaining := len(s.consumers)
 	s.mu.Unlock()
+
+	// Trace-only: the per-transport disconnect log (e.g. `[rtsp] disconnect`)
+	// already records who left, but it doesn't show the stream's resulting
+	// consumer count. Surfacing that here closes a gap during incident
+	// reconstruction — without it, you cannot tell from logs alone whether
+	// a producer.stop() that follows is the last-consumer teardown or one
+	// of many simultaneous removals.
+	log.Trace().Int("remaining", remaining).Msg("[streams] consumer removed")
 
 	s.stopProducers()
 }
@@ -97,12 +106,22 @@ type remoteAddrer interface {
 }
 
 // kickGracePeriod is how long producers are held alive after kickConsumers
-// fires so kicked clients (e.g. UniFi Protect) can reconnect without
-// hitting a cold producer that has to spin back up. 30s easily covers
-// UniFi's normal 1–3s reconnect window and tolerates cloud-API throttles
-// (Google's Nest API briefly rate-limits successive WebRTC re-establishes).
+// fires so kicked clients can reconnect without hitting a cold producer
+// that has to spin back up.
+//
+// 2 minutes — long enough to cover the worst case observed in practice:
+// UniFi Protect's RTSP retry back-off after a session that closed shortly
+// after opening (which it interprets as a server-instability signal).
+// Empirically UniFi waits ~60-90s in that mode before retrying. We add
+// margin on top of the advertised `Session:timeout=60` for safety.
+//
+// Trade-off: a producer with no consumers for the full grace window keeps
+// streaming from upstream (small ongoing bandwidth cost — ~50-200 kbps
+// for a typical Nest stream). Worth it to avoid recording gaps that
+// require manual intervention to clear.
+//
 // Exposed as a package variable so tests can shorten it.
-var kickGracePeriod = 30 * time.Second
+var kickGracePeriod = 2 * time.Minute
 
 // kickConsumers disconnects all consumers attached to this stream.
 // Called after a Producer reconnect when downstream consumers may be
@@ -129,30 +148,103 @@ var kickGracePeriod = 30 * time.Second
 // "producer reconnect: <scheme>".
 func (s *Stream) kickConsumers(reason string) {
 	s.mu.Lock()
+	// Snapshot consumers and producer URLs in one critical section so the
+	// internal-consumer skip below is consistent with the current set of
+	// producers.
 	consumers := make([]core.Consumer, len(s.consumers))
 	copy(consumers, s.consumers)
+	producerURLs := make(map[string]struct{}, len(s.producers))
+	for _, p := range s.producers {
+		if p.url != "" {
+			producerURLs[p.url] = struct{}{}
+		}
+	}
 	s.mu.Unlock()
 
 	if len(consumers) == 0 {
 		return
 	}
 
-	// Collect remote addresses for the log line so a single grep on the
-	// kick event tells you exactly which clients were notified.
+	// Trace dump of the comparison inputs (producer URLs the skip-logic
+	// is matching against). Combined with the per-consumer "kick filter"
+	// trace below, this gives a full picture of why each consumer was or
+	// wasn't kicked. URLs are redacted (query string stripped) to avoid
+	// leaking credentials in shared trace dumps.
+	if log.Trace().Enabled() {
+		urls := make([]string, 0, len(producerURLs))
+		for u := range producerURLs {
+			urls = append(urls, redactSourceURL(u))
+		}
+		log.Trace().Strs("producer_urls", urls).Msg("[streams] kick start")
+	}
+
+	// Filter out internal-loop consumers — i.e. consumers whose source URL
+	// matches one of this stream's producers. These are the inner ends of
+	// recursive ffmpeg-style pipelines (e.g. `ffmpeg:driveway` is a
+	// producer whose subprocess reads `rtsp://localhost/driveway` and
+	// registers as a consumer). Kicking such a consumer kills the very
+	// producer that just reconnected, triggering an instant reconnect loop.
+	// Matches the loop-protection check in AddConsumer.
+	toKick := make([]core.Consumer, 0, len(consumers))
 	remotes := make([]string, 0, len(consumers))
+	skipped := make([]string, 0)
 	for _, cons := range consumers {
+		// Diagnostic: trace-level per-consumer match attempt. Helps verify
+		// the skip-logic is correctly engaging (or diagnose why it's not)
+		// without enabling per-line debug log dumps. Visible at
+		// streams=trace.
+		var consSource, consRemote string
+		if info, ok := cons.(core.Info); ok {
+			consSource = info.GetSource()
+		}
 		if r, ok := cons.(remoteAddrer); ok {
-			if addr := r.GetRemoteAddr(); addr != "" {
-				remotes = append(remotes, addr)
-			}
+			consRemote = r.GetRemoteAddr()
+		}
+
+		_, isInternal := producerURLs[consSource]
+		log.Trace().
+			Str("remote", consRemote).
+			Str("source", redactSourceURL(consSource)).
+			Bool("is_internal", isInternal && consSource != "").
+			Msg("[streams] kick filter")
+
+		if isInternal && consSource != "" {
+			skipped = append(skipped, consSource)
+			continue
+		}
+
+		toKick = append(toKick, cons)
+		if consRemote != "" {
+			remotes = append(remotes, consRemote)
 		}
 	}
 
-	log.Debug().
-		Int("count", len(consumers)).
+	if len(toKick) == 0 {
+		// Every consumer was an internal-loop. Surface this at debug so
+		// the no-op kick is visible during diagnosis — otherwise a
+		// reconnect cycle dominated by internal consumers would show
+		// repeated "producer reconnected" lines with no kick output and
+		// look mysteriously inert.
+		if len(skipped) > 0 {
+			log.Debug().
+				Int("consumers", len(consumers)).
+				Strs("skipped_internal", skipped).
+				Str("reason", reason).
+				Msg("[streams] kick skipped: all consumers are internal-loop")
+		}
+		return
+	}
+
+	ev := log.Debug().
+		Int("count", len(toKick)).
 		Strs("remotes", remotes).
-		Str("reason", reason).
-		Msg("[streams] kicking consumers")
+		Str("reason", reason)
+	if len(skipped) > 0 {
+		// Tells operators which producers' inner consumers were exempted,
+		// which both explains lower kick counts and surfaces topology.
+		ev = ev.Strs("skipped_internal", skipped)
+	}
+	ev.Msg("[streams] kicking consumers")
 
 	// Hold producers alive during the grace window. See kickGracePeriod.
 	s.pending.Add(1)
@@ -162,7 +254,7 @@ func (s *Stream) kickConsumers(reason string) {
 		}
 	})
 
-	for _, cons := range consumers {
+	for _, cons := range toKick {
 		_ = cons.Stop()
 	}
 }
@@ -192,21 +284,36 @@ func (s *Stream) stopProducers() {
 	}
 
 	s.mu.Lock()
+	var stopped, kept int
 producers:
 	for _, producer := range s.producers {
 		for _, track := range producer.receivers {
 			if len(track.Senders()) > 0 {
+				kept++
 				continue producers
 			}
 		}
 		for _, track := range producer.senders {
 			if len(track.Senders()) > 0 {
+				kept++
 				continue producers
 			}
 		}
 		producer.stop()
+		stopped++
 	}
 	s.mu.Unlock()
+
+	// Per-call summary: which branch did the decision take? Until now,
+	// stopProducers either logged "skip stop pending producer" or was
+	// silent — so a stopProducers that kept all producers (senders still
+	// attached) looked identical in logs to one that wasn't called at
+	// all. With this line we can tell when producers WERE kept alive
+	// because senders held them up vs. when no consumer left in the
+	// first place.
+	if stopped > 0 || kept > 0 {
+		log.Trace().Int("stopped", stopped).Int("kept", kept).Msg("[streams] stopProducers")
+	}
 }
 
 func (s *Stream) MarshalJSON() ([]byte, error) {

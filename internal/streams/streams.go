@@ -22,6 +22,15 @@ func Init() {
 
 	log = app.GetLogger("streams")
 
+	// Surface the kick-on-reconnect mode at startup. Without this the
+	// only signal of the active setting is its absence from reconnect
+	// logs, which is easy to miss during incident triage.
+	if kickOnReconnect {
+		log.Info().Msg("[streams] kick on producer reconnect: enabled (GO2RTC_KICK_ON_RECONNECT=true)")
+	} else {
+		log.Info().Msg("[streams] kick on producer reconnect: disabled — set GO2RTC_KICK_ON_RECONNECT=true to re-enable for legacy RTSP clients")
+	}
+
 	for name, item := range cfg.Streams {
 		streams[name] = NewStream(item)
 	}

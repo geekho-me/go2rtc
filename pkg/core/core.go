@@ -69,6 +69,25 @@ type Consumer interface {
 	Stop() error
 }
 
+// LifetimeLimited is an optional interface for Producers whose upstream
+// has a known maximum stream lifetime (e.g. Google Nest WebRTC enforces
+// a ~60 min cap per session, after which a fresh offer/answer is
+// required). When implemented, the wrapping streams.Producer registers
+// a reconnect callback during start, and the underlying producer can
+// invoke it ahead of the lifetime limit to trigger a proactive
+// connection swap. This avoids the data gap that comes from waiting
+// for the upstream to silently stop delivering frames.
+//
+// The callback is goroutine-safe; the producer may invoke it from any
+// goroutine. It is idempotent — repeated calls during a single
+// reconnect cycle no-op via the streams.Producer workerID guard. The
+// implementation is expected to swap the callback under its own lock
+// (the wrapping Producer may call SetReconnectCallback again after a
+// reconnect creates a new underlying connection).
+type LifetimeLimited interface {
+	SetReconnectCallback(cb func())
+}
+
 type Mode byte
 
 const (

@@ -182,11 +182,31 @@ as the primary client/source combination.
   the producer (~6s for Nest WebRTC), often timing out and entering
   a long back-off cycle (observed 7-minute recording gaps).
   To prevent this, `kickConsumers()` bumps the `s.pending` counter
-  for a 30-second grace window — long enough for typical UniFi
-  reconnect (1–3s) plus margin for cloud-API throttling on
-  successive Nest WebRTC re-establishments. `stopProducers()` already
+  for a 2-minute grace window. `stopProducers()` already
   short-circuits when `pending > 0`, so the producer stays warm and
   the reconnecting client lands cleanly on it.
+  2 minutes is sized for the worst case observed in practice: when
+  UniFi Protect's RTSP session closes shortly after opening (e.g. a
+  natural reconnect followed by a kick ~10s later), it interprets
+  this as server instability and enters an extended retry back-off
+  (empirically ~60–90s before re-DESCRIBE). An earlier 30s grace
+  window expired during this back-off, the producer stopped, and
+  when UniFi finally retried it hit a cold producer and timed out
+  again — repeating the recording gap. 2 minutes covers this case
+  with margin. Trade-off: an orphan producer keeps streaming from
+  upstream for up to 2 minutes (~50–200 kbps for a typical Nest
+  stream); cheap compared to recording gaps that require manual
+  intervention.
+- **Internal-loop consumer skip:** Recursive pipelines like
+  `ffmpeg:driveway` (an ffmpeg subprocess that reads from
+  `rtsp://localhost/driveway` and is registered as a consumer of the
+  driveway stream while *also* being a producer of it) need special
+  handling. Kicking the inner ffmpeg subprocess on producer reconnect
+  killed its stdout → producer EOF'd → triggered another reconnect →
+  kicked again → infinite ~5-per-second loop. Fix: in
+  `kickConsumers()` skip any consumer whose `GetSource()` matches one
+  of this stream's producer URLs. Matches the existing loop-protection
+  check in `AddConsumer`.
 - **Earlier failed attempt (now reverted):** A `SetReadDeadline()`-
   based fast silence detection (commits 58f1495, 9a1ad59, 1254ea9)
   tried to reduce the ~95s detection latency for terminal silences.
@@ -195,13 +215,51 @@ as the primary client/source combination.
   relied on. The kick-consumers fix in this commit addresses the
   underlying codec-refresh problem directly, so fast detection could
   be safely re-introduced in a follow-up if desired.
-- **Test coverage:** `TestKickConsumers` (4 sub-tests: empty,
-  multiple, no list mutation, grace-period pending bump/release),
+- **Test coverage:** `TestKickConsumers` (6 sub-tests: empty,
+  multiple, no list mutation, internal-loop consumer is skipped,
+  no grace-period bump when only internal consumers,
+  grace-period pending bump/release),
   `TestNewStreamLinksProducers` (3
   sub-tests: single string, []string, []any construction paths),
   `TestRedactSourceURL` (6 sub-tests covering nest, rtsp with auth,
   ffmpeg, fragment-only, empty). Uses a `mockConsumer` implementing
   `core.Consumer` with an atomic Stop counter.
+
+### 8b-1. Kick on reconnect: disabled by default (UniFi 7.1.69 regression)
+
+- **Files:** `internal/streams/producer.go`, `internal/streams/streams.go`
+- **Change:** The auto-kick described in section 8b is now gated by
+  the `GO2RTC_KICK_ON_RECONNECT` environment variable. Default:
+  **off**. At startup the active mode is logged at info level
+  (`[streams] kick on producer reconnect: disabled — set
+  GO2RTC_KICK_ON_RECONNECT=true to re-enable for legacy RTSP
+  clients`).
+- **Why:** Empirical regression after upgrading UniFi Protect to
+  7.1.69. A nest WebRTC reconnect at 19:01:36 triggered the kick
+  (correct: 2 UniFi RTSP sessions closed). Pre-7.1.69, UniFi
+  re-DESCRIBEd within 1–3s. On 7.1.69, **UniFi made zero RTSP
+  reconnect attempts** during the entire 2-minute grace window
+  even though the snapshot poll endpoint kept responding — so the
+  recording session was severed permanently and the grace period
+  bandaged no wound. The new heartbeat (section 13) confirmed
+  nest's H264/OPUS packet rates were fully healthy after reconnect;
+  the only thing missing was UniFi.
+- **Hypothesis:** UniFi 7.1.69 either (a) interprets a
+  server-initiated TCP close as intentional and stops retrying,
+  or (b) trusts its GStreamer 1.26+ H.264 parser to handle
+  in-band SPS/PPS changes via RTP. Either way, the kick is now
+  counterproductive for that client. Pre-7.1.69 UniFi and other
+  RTSP clients that genuinely can't handle in-band parameter
+  changes can opt back in with the env var.
+- **Trade-off:** If the new nest connection's SPS/PPS differ from
+  the previous one and the RTSP client cannot pick up the change
+  from in-band parameter sets, video stays frozen until the
+  client itself disconnects (UniFi 7.1.69 reportedly does this
+  on its own when frames stop arriving — needs verification in
+  next outage).
+- **No test changes:** The existing `TestKickConsumers` exercises
+  `kickConsumers()` directly and is unaffected by the gate, which
+  sits one layer up in `Producer.reconnect()`.
 
 ### 8c. Streams logging: info/warn levels + credential redaction
 
@@ -281,6 +339,36 @@ as the primary client/source combination.
   against transient extension failures (a single Google 5xx would kill
   the stream until next reconnect).
 
+### 10b. OAuth 401 refresh in ExtendStream + token-cache eviction fix
+
+- **Files:** `pkg/nest/api.go`
+- **Change:** Two coupled fixes around Google OAuth bearer-token expiry.
+  - **`ExtendStream()` now handles 401.** On a 401 response, it calls
+    `refreshToken()` and retries the request once with the new token.
+    Mirrors the existing 401 handling in `ExchangeSDP()`. The retry
+    uses a helper closure so the same `*http.Request` body isn't
+    drained twice.
+  - **`refreshToken()` rewritten to actually refresh.** The previous
+    implementation called `NewAPI()` to "get a new token" — but
+    `NewAPI()`'s cache returns the same `*API` instance when the
+    recorded `ExpiresAt` is still in the future, so the "refreshed"
+    token was identical to the stale one. The new implementation
+    bypasses the cache entirely: POSTs directly to the Google OAuth
+    token endpoint and mutates `a.Token` + `a.ExpiresAt` in place.
+    Serialized via a new `refreshMu` so concurrent 401s fold into a
+    single refresh request.
+- **Why:** Google OAuth access tokens for the Smart Device Management
+  API expire after ~60 minutes. Each Nest stream session also runs
+  up to ~60 minutes, so it's normal for an extend to land on a
+  freshly-expired token — empirically observed (2026-05-22 09:36
+  outage): an extend after the OAuth boundary 401'd, the broken
+  `refreshToken()` no-op'd, the retry 401'd again, the extend
+  goroutine gave up, and the stream silently died at its next
+  `expires_at`. With the fix, the same boundary now shows
+  `[nest] extend got 401, refreshing OAuth token` → `[nest] OAuth
+  token refreshed` → `[nest] extend ok` in quick succession; stream
+  continues uninterrupted.
+
 ---
 
 ## Observability
@@ -335,6 +423,216 @@ as the primary client/source combination.
   Same grep patterns work for any client interaction regardless of
   protocol.
 
+### 12b. Proactive reconnect ahead of Nest's stream-lifetime cap
+
+- **Files:** `pkg/core/core.go`, `internal/streams/producer.go`,
+  `pkg/nest/client.go`
+- **Change:** Two-part addition that eliminates the ~30-40 s
+  recording gap that recurred every ~66 minutes on the Nest
+  → go2rtc → UniFi Protect pipeline:
+  - **`core.LifetimeLimited` interface** — an optional hook
+    `SetReconnectCallback(cb func())` that producers implement to
+    receive a proactive-reconnect trigger from the wrapping
+    `streams.Producer`. Generic, not Nest-specific; any source
+    with a known stream-lifetime cap can opt in.
+  - **`streams.Producer.proactiveReconnect()`** — bumps `workerID`
+    so the soon-to-exit old worker's post-Start `reconnect()`
+    call no-ops, then runs the standard `reconnect()` flow. That
+    flow is already overlap-friendly: new conn via `GetProducer`,
+    tracks moved via `Receiver.Replace()` before the old conn is
+    stopped. Consumers see only the brief `GetProducer` window
+    (~3 s for Nest), not the previous ~30-40 s detection chain.
+    Callback registration happens in `start()` (initial conn)
+    and again in `reconnect()` (post-swap onto the new conn) so
+    every lifetime cycle is caught.
+  - **Nest `WebRTCClient` / `RTSPClient` implement
+    `LifetimeLimited`.** Each `Start()` arms a one-shot
+    `time.AfterFunc(refreshBeforeCap, ...)` (default: 55 minutes,
+    package-var for tests). When the timer fires, the wrapped
+    producer's `proactiveReconnect()` is invoked in a fresh
+    goroutine so the timer runner isn't blocked by the network
+    work. `Stop()` cancels the timer. `sync.Once`-like
+    `refreshFired` guard prevents double-fire under odd shutdown
+    orderings.
+- **Why:** Google's Nest Smart Device Management API caps a single
+  WebRTC stream at ~60 minutes from initial `GenerateWebRtcStream`,
+  regardless of how often `ExtendWebRtcStream` is called. Past
+  that cap, the upstream silently stops delivering packets and the
+  current reconnect path takes ~30-40 s to notice and recover
+  (inner-ffmpeg 5 s read timeout → 3 retries × 10 s → finally
+  declare EOF → producer reconnect). Empirically observed gap
+  cadence: **01:59, 03:05, 04:11, 05:17, 06:23, 07:30 — exactly
+  ~66 minutes apart**. A proactive refresh at 55 min hits while
+  upstream is still healthy, allowing the swap to complete inside
+  the producer's already-overlap-friendly reconnect flow before
+  the old session goes silent.
+- **Why a generic interface, not a Nest-only hook:** The same
+  pattern applies to any cloud-mediated stream with a session
+  lifetime (Ring, Arlo, Tuya, etc. all have analogous limits).
+  Putting `LifetimeLimited` on `pkg/core` lets each producer opt
+  in without touching the streams package — only the producer
+  itself knows its lifetime contract.
+- **Safety:** `workerID` bump under the producer mutex guarantees
+  the old worker's post-Start `reconnect()` no-ops; otherwise it
+  would race the proactive reconnect into producing a second
+  fresh connection. The previous overlap-friendly reconnect flow
+  is unchanged.
+- **No new tests:** The wiring is small (callback registration on
+  start/reconnect, a one-shot timer in nest client). The
+  user-facing test is the next ~66 min interval after
+  deployment: the gap should either disappear or shrink
+  to seconds.
+
+### 13. Producer activity heartbeat + stopProducers decision trace
+
+- **Files:** `internal/streams/producer.go`, `internal/streams/stream.go`
+- **Change:** Two diagnostic logging additions targeting the
+  "silent stall" failure class — where upstream looks healthy
+  (no EOF, no read-deadline fire) and consumers stay attached, but
+  recording freezes anyway.
+  - **Producer activity heartbeat (debug, every 60s).** Each active
+    producer logs one line per receiver with packet/byte deltas since
+    the previous tick: `[streams] producer activity source=…
+    track=0 codec=H264 dpackets=N dbytes=N total_packets=N`. When
+    `dpackets=0` for a track while a sibling track keeps ticking, the
+    smoking gun is unambiguous (e.g. video frozen, audio flowing —
+    a UniFi+Nest failure mode where prior logs were silent).
+    Heartbeat runs in its own goroutine started from `start()`,
+    exits when `workerID` advances (next cycle or stop). Cadence
+    exposed as `activityInterval` for tests.
+  - **stopProducers decision trace (trace).** Each call now logs
+    `[streams] stopProducers stopped=N kept=N` (skipping the line
+    only when both are zero), so a `RemoveConsumer` that kept all
+    producers alive because senders held them up is distinguishable
+    from one that wasn't triggered. Previously the function was
+    silent in that case.
+  - **Consumer-removed remaining count (trace).** `RemoveConsumer`
+    emits `[streams] consumer removed remaining=N`. The per-transport
+    disconnect log (`[rtsp] disconnect …`) records who left but not
+    the stream's resulting consumer count — without that, a
+    `producer.stop()` that follows can't be tied to the last-consumer
+    teardown vs. one of several simultaneous removals.
+- **Why:** A failure at ~15:20 with the kick fix already deployed
+  showed two blind spots in the existing logs:
+  1. After the kick + reconnect, ffmpeg ADTS warnings (audio) kept
+     appearing for ~17 minutes — so audio was flowing — but we had
+     no way to tell whether video was also flowing. UniFi recording
+     was frozen the whole window. The heartbeat would have shown
+     `dpackets=0` on the H264 track immediately.
+  2. Between the last ADTS warning and the next consumer attach,
+     ~6 minutes elapsed with no log activity. The stopProducers /
+     RemoveConsumer traces close that gap by surfacing the decision
+     branches that were previously implicit.
+- **No new tests:** Both additions are diagnostic logs at debug/trace
+  level with no behavior change; covered by existing tests
+  (compilation + `TestKickConsumers`).
+
+### 14. Structured logging for Nest OAuth/extend lifecycle
+
+- **Files:** `pkg/nest/api.go`, `pkg/nest/client.go`,
+  `internal/nest/init.go`
+- **Change:** Added a package-level `nest.Log` callback (default
+  no-op so `pkg/nest` stays importable without a logging
+  dependency) and wired it up from `internal/nest/init.go` to the
+  application zerolog instance. Used to surface the previously-
+  silent OAuth/extend lifecycle:
+  - `[nest] OAuth cache hit` / `OAuth acquiring new token` (debug)
+  - `[nest] OAuth token acquired expires_at=... ttl=...` (info)
+  - `[nest] OAuth token request rejected status=...` (error)
+  - `[nest] OAuth token refresh starting previous_expires_at=...
+    since_predicted_expiry=...` (debug)
+  - `[nest] OAuth refresh transport error` / `OAuth refresh
+    rejected status=...` (error)
+  - `[nest] OAuth token refreshed new_expires_at=... new_ttl=...`
+    (info)
+  - `[nest] extend timer armed expires_at=... next_fire_in=...
+    session=...` (debug)
+  - `[nest] extend ok expires_at=... next_fire_in=... session=...`
+    (debug)
+  - `[nest] extend failed, retrying in 10s` (warn)
+  - `[nest] extend giving up — stream will die at expires_at`
+    (error)
+  - `[nest] extend got 401, refreshing OAuth token
+    predicted_expires_at=... until_predicted_expiry=...` (info) —
+    sign of `until_predicted_expiry` distinguishes "Google rotated
+    the token earlier than we predicted" (positive) from "we let
+    the token lapse past our own prediction" (negative, expected
+    on the lazy 60-min boundary)
+  - `[nest] extend timer cancelled` / `extend goroutine stopped`
+    (debug)
+  - `[nest] refresh timer fired — triggering proactive reconnect
+    age=55m0s session=...` (info)
+- **Why:** Before this, both successful extends and OAuth refreshes
+  were completely silent, and failure cases produced only a generic
+  error string with no context. The 2026-05-22 09:36 outage took
+  ~10 message turns to diagnose because we were guessing whether
+  extends were firing at all; with this logging, the next OAuth-
+  boundary issue (12:51) was diagnosed from a single grep through
+  the log.
+
+---
+
+## Core / RTP
+
+### 15. RTP continuity rewriting across upstream session swaps
+
+- **Files:** `pkg/core/track.go`, `pkg/core/track_test.go`,
+  `pkg/core/helpers.go`
+- **Change:** `core.Receiver` now rewrites outgoing RTP packets so
+  downstream consumers see a single continuous stream across
+  upstream session swaps (`Receiver.Replace()`, triggered by
+  `Producer.reconnect()` — including the proactive reconnect on
+  lifetime-limited sources, section 12b). Specifically:
+  - **Stable outgoing SSRC.** Each `Receiver` picks a random 32-bit
+    SSRC at creation; that SSRC stays constant for the receiver's
+    lifetime and is transferred to successor receivers in
+    `Receiver.Replace()`. Downstream consumers see one SSRC for
+    the entire duration of their consumer-side session.
+  - **Continuous sequence numbers.** On detected upstream SSRC
+    change, the first packet of the new session is rewritten to
+    `lastOutgoingSeq + 1`. Subsequent packets follow the new
+    session's relative spacing, so jitter buffers see a
+    monotonically advancing sequence space.
+  - **Forward-advancing timestamps.** On the same boundary, the
+    first packet's timestamp is rewritten to `lastOutgoingTS +
+    (codec.ClockRate × wall-clock elapsed)`, clamped to a sane
+    range. This preserves codec-rate spacing across the swap
+    rather than producing a backwards jump or a zero-duration
+    burst.
+  - **No-op for non-RTP codecs.** Gated by `codec.IsRTP()`; raw-
+    payload pipelines (`PayloadTypeRAW`) are untouched.
+  - **Test coverage:** `TestReceiverRTPContinuity` (5 sub-tests:
+    non-RTP passthrough, single-session passthrough, mid-stream
+    SSRC change anchoring, relative-spacing preservation after a
+    swap, Replace state transfer to successor).
+  - **Drive-by:** added missing `StripUserinfo` helper that had a
+    test (`TestStripUserinfo`) but no implementation; was blocking
+    the `pkg/core` test build.
+- **Why:** UniFi Protect 7.1.69's RTSP recording subsystem treats an
+  SSRC change mid-session as "the stream I was recording has
+  ended" and stops writing to disk — even though the RTSP/TCP
+  session stays alive and packets keep arriving. Empirically
+  confirmed (2026-05-22 12:43 outage): the proactive reconnect
+  ran cleanly, the new Nest WebRTC session was healthy, extends
+  worked, and go2rtc was forwarding packets — but UniFi's recorder
+  silently stopped at the moment of the SSRC change. With the
+  continuity rewrite, the proactive reconnect is invisible at the
+  RTP layer; UniFi keeps writing straight through. Empirical
+  validation: 6+ hours of continuous recording across multiple
+  proactive reconnects, with the only stoppage attributable to a
+  separate UniFi Protect bug (RTSP-client freeze affecting all
+  3rd-party cameras simultaneously, recovered by Protect restart).
+- **Why at the Receiver level, not per-Sender:** All consumers of a
+  producer's track see the same Receiver. Rewriting once in the
+  Receiver's `Input` closure means a single state machine handles
+  every downstream consumer; per-Sender rewriting would require
+  cloning each packet per consumer (allocation cost on every RTP
+  packet) and per-consumer state machines. Trade-off: every
+  consumer of a given Receiver sees the same outgoing SSRC. That's
+  fine for typical setups (one upstream, several downstream
+  consumers); if per-consumer SSRC ever becomes a requirement, the
+  rewrite can be moved into the Sender path.
+
 ---
 
 ## Test coverage
@@ -359,13 +657,31 @@ ONVIF server-side changes:
   — verify imaging stubs use the `timg:` namespace and that the
   operation-name dispatcher routes correctly.
 
-No new tests added for the other packages — RTSP / WebRTC / Nest
-changes either touch connection-level code that needs heavy mocking
-to exercise (PLI sending, GET_PARAMETER keepalives, Nest extension
-loop), or pure-state changes (session ID consistency, 501 response)
-that exercise via real-world integration testing. All existing
-tests in `pkg/onvif/onvif_test.go`, `pkg/rtsp/rtsp_test.go`,
-`pkg/rtsp/client_test.go` continue to pass.
+Additional tests added in this iteration:
+
+- `pkg/core/track_test.go::TestReceiverRTPContinuity` (5 sub-tests)
+  — covers the RTP rewriting (section 15): non-RTP passthrough,
+  single-session passthrough, mid-stream SSRC change anchoring,
+  relative-spacing preservation, and Replace state transfer to
+  successor.
+- `internal/streams/stream_test.go::TestKickConsumers` (6 sub-tests
+  including internal-loop-skip and grace-period bump/release —
+  see section 8b/8b-1).
+- `internal/streams/stream_test.go::TestNewStreamLinksProducers`
+  (3 sub-tests covering producer back-reference wiring).
+- `internal/streams/stream_test.go::TestRedactSourceURL` (6 sub-
+  tests covering nest, rtsp+auth, ffmpeg, fragment-only, empty).
+
+No new tests added for the OAuth refresh path (section 10b),
+proactive reconnect wiring (section 12b), or per-producer
+heartbeat (section 13) — these touch goroutine/network paths
+that need heavy mocking to exercise, and are validated by the
+end-to-end integration testing the debugging session amounted to
+(6+ hours of continuous operation across multiple proactive
+reconnects + OAuth boundaries). All existing tests in
+`pkg/onvif/onvif_test.go`, `pkg/rtsp/rtsp_test.go`,
+`pkg/rtsp/client_test.go`, `pkg/core/track_test.go` continue to
+pass.
 
 ## Build verification
 
