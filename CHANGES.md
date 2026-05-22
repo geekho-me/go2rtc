@@ -360,14 +360,13 @@ as the primary client/source combination.
 - **Why:** Google OAuth access tokens for the Smart Device Management
   API expire after ~60 minutes. Each Nest stream session also runs
   up to ~60 minutes, so it's normal for an extend to land on a
-  freshly-expired token — empirically observed (2026-05-22 09:36
-  outage): an extend after the OAuth boundary 401'd, the broken
-  `refreshToken()` no-op'd, the retry 401'd again, the extend
-  goroutine gave up, and the stream silently died at its next
-  `expires_at`. With the fix, the same boundary now shows
-  `[nest] extend got 401, refreshing OAuth token` → `[nest] OAuth
-  token refreshed` → `[nest] extend ok` in quick succession; stream
-  continues uninterrupted.
+  freshly-expired token. Without the fix, an extend after the OAuth
+  boundary 401s, the broken `refreshToken()` no-ops, the retry 401s
+  again, the extend goroutine gives up, and the stream silently dies
+  at its next `expires_at`. With the fix, the same boundary now
+  shows `[nest] extend got 401, refreshing OAuth token` →
+  `[nest] OAuth token refreshed` → `[nest] extend ok` in quick
+  succession; stream continues uninterrupted.
 
 ---
 
@@ -460,12 +459,13 @@ as the primary client/source combination.
   that cap, the upstream silently stops delivering packets and the
   current reconnect path takes ~30-40 s to notice and recover
   (inner-ffmpeg 5 s read timeout → 3 retries × 10 s → finally
-  declare EOF → producer reconnect). Empirically observed gap
-  cadence: **01:59, 03:05, 04:11, 05:17, 06:23, 07:30 — exactly
-  ~66 minutes apart**. A proactive refresh at 55 min hits while
-  upstream is still healthy, allowing the swap to complete inside
-  the producer's already-overlap-friendly reconnect flow before
-  the old session goes silent.
+  declare EOF → producer reconnect). Without proactive refresh,
+  recording gaps recur on a roughly ~66-minute cadence (the 60-min
+  cap plus a few minutes of residual delivery and detection
+  latency). A proactive refresh at 55 min hits while upstream is
+  still healthy, allowing the swap to complete inside the
+  producer's already-overlap-friendly reconnect flow before the
+  old session goes silent.
 - **Why a generic interface, not a Nest-only hook:** The same
   pattern applies to any cloud-mediated stream with a session
   lifetime (Ring, Arlo, Tuya, etc. all have analogous limits).
@@ -512,17 +512,18 @@ as the primary client/source combination.
     the stream's resulting consumer count — without that, a
     `producer.stop()` that follows can't be tied to the last-consumer
     teardown vs. one of several simultaneous removals.
-- **Why:** A failure at ~15:20 with the kick fix already deployed
-  showed two blind spots in the existing logs:
-  1. After the kick + reconnect, ffmpeg ADTS warnings (audio) kept
-     appearing for ~17 minutes — so audio was flowing — but we had
-     no way to tell whether video was also flowing. UniFi recording
-     was frozen the whole window. The heartbeat would have shown
-     `dpackets=0` on the H264 track immediately.
-  2. Between the last ADTS warning and the next consumer attach,
-     ~6 minutes elapsed with no log activity. The stopProducers /
-     RemoveConsumer traces close that gap by surfacing the decision
-     branches that were previously implicit.
+- **Why:** Two blind spots in the existing logs made the "silent
+  stall" class of failures hard to diagnose:
+  1. After a kick + reconnect, ffmpeg ADTS warnings (audio) kept
+     appearing for many minutes — so audio was flowing — but there
+     was no way to tell whether video was also flowing while UniFi
+     recording sat frozen. The heartbeat surfaces this as
+     `dpackets=0` on the affected track immediately.
+  2. Multi-minute gaps with no log activity at all were ambiguous:
+     was nothing happening, or was something happening silently?
+     The `stopProducers` decision trace + the consumer-removed
+     remaining count surface the decision branches that were
+     previously implicit.
 - **No new tests:** Both additions are diagnostic logs at debug/trace
   level with no behavior change; covered by existing tests
   (compilation + `TestKickConsumers`).
@@ -564,11 +565,11 @@ as the primary client/source combination.
     age=55m0s session=...` (info)
 - **Why:** Before this, both successful extends and OAuth refreshes
   were completely silent, and failure cases produced only a generic
-  error string with no context. The 2026-05-22 09:36 outage took
-  ~10 message turns to diagnose because we were guessing whether
-  extends were firing at all; with this logging, the next OAuth-
-  boundary issue (12:51) was diagnosed from a single grep through
-  the log.
+  error string with no context — making it impossible to tell from
+  logs alone whether extends were firing, whether a 401 was being
+  refreshed, or whether the refresh itself was failing. With this
+  logging, any OAuth/extend issue is diagnosable from a single
+  filtered pass through the log.
 
 ---
 
@@ -611,17 +612,13 @@ as the primary client/source combination.
 - **Why:** UniFi Protect 7.1.69's RTSP recording subsystem treats an
   SSRC change mid-session as "the stream I was recording has
   ended" and stops writing to disk — even though the RTSP/TCP
-  session stays alive and packets keep arriving. Empirically
-  confirmed (2026-05-22 12:43 outage): the proactive reconnect
-  ran cleanly, the new Nest WebRTC session was healthy, extends
-  worked, and go2rtc was forwarding packets — but UniFi's recorder
-  silently stopped at the moment of the SSRC change. With the
-  continuity rewrite, the proactive reconnect is invisible at the
-  RTP layer; UniFi keeps writing straight through. Empirical
-  validation: 6+ hours of continuous recording across multiple
-  proactive reconnects, with the only stoppage attributable to a
-  separate UniFi Protect bug (RTSP-client freeze affecting all
-  3rd-party cameras simultaneously, recovered by Protect restart).
+  session stays alive and packets keep arriving. Without the
+  rewrite, every proactive reconnect (section 12b) silently stops
+  UniFi recording at the moment of the SSRC change. With the
+  rewrite, the proactive reconnect is invisible at the RTP layer
+  and UniFi keeps writing straight through. Validated against
+  several hours of continuous recording across multiple proactive
+  reconnects.
 - **Why at the Receiver level, not per-Sender:** All consumers of a
   producer's track see the same Receiver. Rewriting once in the
   Receiver's `Input` closure means a single state machine handles
