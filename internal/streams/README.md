@@ -84,6 +84,42 @@ streams:
     - ffmpeg:camera3#video=h264#audio=opus#hardware
 ```
 
+## Environment variables
+
+### `GO2RTC_KICK_ON_RECONNECT`
+
+After a producer reconnect (for example, a Nest WebRTC stream
+re-establishing after its lifetime cap), go2rtc can optionally
+force-disconnect downstream RTSP/WebRTC consumers so they
+re-`DESCRIBE` and pick up the new source's SDP. This used to be
+needed because some RTSP clients can't pick up in-band SPS/PPS
+changes mid-session and freeze on the new bitstream.
+
+The current default is **disabled** because modern RTSP clients
+(GStreamer 1.26+, including UniFi Protect 7.1.x) handle in-band
+parameter changes correctly via the H.264/H.265 parser, and
+UniFi Protect 7.1.69 specifically does not re-`DESCRIBE` after a
+server-initiated TCP close — making the kick actively
+counterproductive for that client.
+
+Set `GO2RTC_KICK_ON_RECONNECT=true` to re-enable the legacy
+behavior. Appropriate for older RTSP clients or for any consumer
+that genuinely cannot tolerate an in-band codec-parameter
+change.
+
+```bash
+# disable (default) — modern clients handle in-band SPS/PPS
+docker run -e GO2RTC_KICK_ON_RECONNECT=false alexxit/go2rtc
+# enable legacy kick behavior
+docker run -e GO2RTC_KICK_ON_RECONNECT=true  alexxit/go2rtc
+```
+
+The active setting is logged at startup at info level:
+
+```
+[streams] kick on producer reconnect: disabled — set GO2RTC_KICK_ON_RECONNECT=true to re-enable for legacy RTSP clients
+```
+
 ## Examples
 
 ```yaml
