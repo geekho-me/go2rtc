@@ -82,6 +82,38 @@ as the primary client/source combination.
   occasionally failed adoption. Stub responses (empty configurations)
   cleanly declare "no imaging features supported".
 
+### 4b. Documented: ONVIF server does not authenticate requests
+
+- **Files:** `internal/onvif/README.md`
+- **Change:** Added a "Security" subsection to the ONVIF README
+  documenting that go2rtc's ONVIF server dispatches every
+  operation without parsing or verifying the SOAP
+  `wsse:UsernameToken` element. Credentials prompted for by
+  NVR/HA adoption tools (UniFi Protect, Home Assistant, etc.) are
+  decorative; any value succeeds. The note covers what IS still
+  protected (the underlying RTSP/HTTP stream URLs, which carry
+  their own auth) and what is NOT (camera-setup metadata
+  enumeration via `GetProfiles`,
+  `GetVideoEncoderConfiguration`, etc.). Recommends treating the
+  go2rtc API port as trusted-network only.
+- **Why:** Operators integrating go2rtc with NVRs typically see
+  a credential prompt during adoption and assume those
+  credentials are validated server-side. They aren't — and
+  exposing the ONVIF endpoint beyond a trusted network would
+  leak camera-setup details to unauthenticated callers. This is
+  upstream behaviour, not specific to this fork; the note exists
+  to make the implicit explicit. No code change.
+- **Upstream fix in progress (not adopted here):** the open
+  pull request https://github.com/AlexxIT/go2rtc/pull/2231 adds
+  WS-Security `UsernameToken` validation to the ONVIF server,
+  gated by dedicated `onvif.username` / `onvif.password` config
+  keys and with a `GetSystemDateAndTime` carve-out so clients
+  can compute clock skew before generating password digests.
+  Tracking the PR rather than merging it locally — this fork
+  prefers to wait for upstream review. The README links to the
+  PR so operators who need authenticated ONVIF in their own
+  deployment know where to find a reference implementation.
+
 ---
 
 ## RTSP Server
