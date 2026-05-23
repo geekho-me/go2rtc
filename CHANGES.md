@@ -807,3 +807,36 @@ pass.
 All changes compile under Go 1.25 with no new dependencies. Built and
 deployed continuously through the debugging session against the
 production go2rtc Docker image (`docker/Dockerfile`, multi-stage build).
+
+---
+
+## CI / Build
+
+### 16. Weekly scheduled rebuild for CVE refresh
+
+- **Files:** `.github/workflows/build.yml`
+- **Change:** The Docker-image workflow gains two coupled additions:
+  - A `schedule:` trigger (`cron: '0 4 * * 0'` — Sunday 04:00 UTC)
+    alongside the existing `workflow_dispatch` and `push` triggers,
+    so the published image is rebuilt weekly even when no commits
+    land.
+  - `pull: true` on the `docker/build-push-action@v6` step so the
+    base layers (`FROM golang:${GO_VERSION}-alpine` and
+    `FROM python:${PYTHON_VERSION}-alpine`) re-resolve against the
+    registry on every build. Without this the GitHub-Actions layer
+    cache can indefinitely re-use a vulnerable `apk add` layer
+    because the cache key matches the unchanged instruction text;
+    `pull: true` bumps the parent layer SHA whenever Alpine ships
+    a refreshed base image, which invalidates downstream cache and
+    forces `apk` to re-install at current package versions.
+- **Why:** Tagged releases of go2rtc are infrequent. Between
+  releases, the `master` and `latest` images' OS package set was
+  frozen at the last code push to `master`, while Alpine ships
+  CVE-fix updates constantly. Combining the weekly rebuild with
+  `pull: true` gives a predictable CVE-refresh cadence without
+  needing a code change.
+- **Source:** Pattern adopted from open upstream pull request
+  https://github.com/AlexxIT/go2rtc/pull/2242. The fork's
+  workflow is Docker-only (no `build-binaries` job), so the
+  trade-off the upstream PR's author noted does not apply here.
+- **No code change, no test impact.**
