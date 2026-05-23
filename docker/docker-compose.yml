@@ -1,0 +1,109 @@
+# Example docker-compose.yml for the geekho-me/go2rtc fork.
+#
+# This fork carries additional reliability and observability changes
+# documented in ../CHANGES.md. The image is rebuilt weekly by the CI
+# workflow (Sunday 04:00 UTC) so the `:latest` tag picks up Alpine
+# CVE fixes between tagged releases — schedule a periodic
+# `docker compose pull && docker compose up -d` on your host (or use
+# watchtower / similar) to actually adopt those refreshes.
+#
+# Before bringing this up:
+#   1. Edit the network/IP/MAC below to match your environment.
+#      The MAC and IP MUST be unique on your network; don't copy
+#      the placeholders verbatim into a production stack.
+#   2. If you need FFmpeg hardware acceleration, add back the
+#      `devices:` and `group_add:` blocks shown in the note below
+#      the `restart:` line. The default config below assumes
+#      software-only transcoding.
+#
+# Configuration is managed from the go2rtc WebUI (Configuration
+# section at http://<container-ip>:1984/), not by editing the
+# YAML file on disk — so the /config volume below just needs to
+# persist; no bind mount required.
+
+services:
+  go2rtc:
+    image: ghcr.io/geekho-me/go2rtc:latest
+    container_name: go2rtc
+    restart: unless-stopped
+
+    environment:
+      # Set to your timezone — affects timestamps in logs.
+      - TZ=Europe/London
+
+    # 256 MB × 4 files ≈ 1 GB of rolling logs per container. The
+    # Docker default (10 MB, 1 file) fills in minutes once
+    # --log.level=debug is on — and several of this fork's
+    # diagnostic logs (producer activity heartbeats, OAuth/extend
+    # lifecycle, etc.) are debug-level. Increase further if you
+    # need more debugging history.
+    logging:
+      driver: "json-file"
+      options:
+        max-size: "256m"
+        max-file: "4"
+
+    volumes:
+      # Named volume declared at the bottom of this file. Persists
+      # the in-app configuration across container recreation;
+      # inspect the on-host path with `docker volume inspect go2rtc`
+      # if you ever need to back it up or migrate it.
+      - go2rtc:/config
+
+    # Healthcheck against go2rtc's internal HTTP API. If the API
+    # stops responding (process panic, deadlock, etc.), Docker
+    # marks the container unhealthy — combine with
+    # `restart: unless-stopped` plus an external orchestrator
+    # (watchtower / docker-autoheal / systemd) for automatic
+    # recovery. The /api endpoint returns 200 even with no
+    # configured streams. curl is already installed in the image
+    # via docker/Dockerfile's `apk add` line.
+    healthcheck:
+      test: ["CMD", "curl", "-fsS", "http://127.0.0.1:1984/api"]
+      interval: 30s
+      timeout: 5s
+      start_period: 15s
+      retries: 3
+
+    networks:
+      server_vlan:
+        # CHANGE BOTH to match your network. The IP must be on the
+        # same subnet as `server_vlan` (defined out-of-band as an
+        # external macvlan — see the networks block below) and
+        # must be unused elsewhere on that subnet.
+        ipv4_address: 192.168.1.100
+
+        # Locally-administered MAC (first octet 02, second-least-
+        # significant bit set). Pick a unique value for each
+        # container you deploy — DHCP reservations and MAC-based
+        # firewall rules upstream of the host depend on it being
+        # stable AND unique. The example below is a deliberately
+        # obvious placeholder.
+        mac_address: 02:42:00:00:00:01
+
+# Named volume holding /config. Without this top-level declaration
+# Compose rejects the `go2rtc:/config` reference under services as
+# "invalid compose project: refers to undefined volume go2rtc".
+volumes:
+  go2rtc:
+
+networks:
+  # Pre-existing macvlan network on your host. Create it once with
+  # (adjust subnet/gateway/parent for your network):
+  #   docker network create -d macvlan \
+  #     --subnet=192.168.1.0/24 --gateway=192.168.1.1 \
+  #     -o parent=eth0 server_vlan
+  #
+  # `external: true` means Compose won't try to manage this
+  # network's lifecycle — it just references it. If you'd rather
+  # have Compose create the network, drop `external: true` and add
+  # the full `driver: macvlan` + `driver_opts:` + `ipam:` block
+  # here.
+  #
+  # Macvlan gives the container its own IP on your LAN, which
+  # means ports 1984 (HTTP/WebUI), 8554 (RTSP), and 8555 (WebRTC,
+  # TCP+UDP) are reachable directly via the container's IP — no
+  # `ports:` mapping needed. If you switch to a different network
+  # type (bridge, host), revisit port exposure accordingly.
+  server_vlan:
+    external: true
