@@ -11,15 +11,6 @@
 #   1. Edit the network/IP/MAC below to match your environment.
 #      The MAC and IP MUST be unique on your network; don't copy
 #      the placeholders verbatim into a production stack.
-#   2. If you need FFmpeg hardware acceleration, add back the
-#      `devices:` and `group_add:` blocks shown in the note below
-#      the `restart:` line. The default config below assumes
-#      software-only transcoding.
-#
-# Configuration is managed from the go2rtc WebUI (Configuration
-# section at http://<container-ip>:1984/), not by editing the
-# YAML file on disk — so the /config volume below just needs to
-# persist; no bind mount required.
 
 services:
   go2rtc:
