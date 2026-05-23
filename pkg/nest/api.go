@@ -144,7 +144,10 @@ func (a *API) GetDevices(projectID string) ([]DeviceInfo, error) {
 
 	req.Header.Set("Authorization", "Bearer "+a.Token)
 
-	client := &http.Client{Timeout: time.Second * 5000}
+	// 10 s timeout (was time.Second * 5000 ≈ 83 minutes — almost certainly
+	// an upstream typo for 5s; left as 10s so flaky Google API calls fail
+	// fast instead of blocking a goroutine for over an hour).
+	client := &http.Client{Timeout: 10 * time.Second}
 	res, err := client.Do(req)
 	if err != nil {
 		return nil, err
@@ -221,7 +224,9 @@ func (a *API) ExchangeSDP(projectID, deviceID, offer string) (string, error) {
 
 		req.Header.Set("Authorization", "Bearer "+a.Token)
 
-		client := &http.Client{Timeout: time.Second * 5000}
+		// 10 s timeout — see GetDevices for context on why we dropped from
+		// the upstream 5000s value.
+		client := &http.Client{Timeout: 10 * time.Second}
 		res, err := client.Do(req)
 		if err != nil {
 			return "", err
@@ -364,6 +369,19 @@ func (a *API) refreshToken() error {
 	return nil
 }
 
+// extendBackoffInitial is the initial back-off delay for transient
+// 409/429 responses in ExtendStream. Doubles after each failed retry up
+// to maxRetries. Exposed as a package variable so tests can shorten it.
+var extendBackoffInitial = 30 * time.Second
+
+// extendURI builds the Google SDM API URI for a stream-extend command.
+// Hookable for tests so they can point requests at an httptest server
+// without needing a live Google endpoint or network access.
+var extendURI = func(projectID, deviceID string) string {
+	return "https://smartdevicemanagement.googleapis.com/v1/enterprises/" +
+		projectID + "/devices/" + deviceID + ":executeCommand"
+}
+
 func (a *API) ExtendStream() error {
 	var reqv struct {
 		Command string `json:"command"`
@@ -388,77 +406,100 @@ func (a *API) ExtendStream() error {
 		return err
 	}
 
-	uri := "https://smartdevicemanagement.googleapis.com/v1/enterprises/" +
-		a.StreamProjectID + "/devices/" + a.StreamDeviceID + ":executeCommand"
+	uri := extendURI(a.StreamProjectID, a.StreamDeviceID)
 
-	// Helper because the request must be replayed verbatim after a 401
-	// refresh (a single *http.Request can't be Do'd twice — the body
-	// reader would be drained).
+	// Helper because the request must be replayed verbatim after a retry
+	// (a single *http.Request can't be Do'd twice — the body reader
+	// would be drained).
 	doRequest := func() (*http.Response, error) {
 		req, err := http.NewRequest("POST", uri, bytes.NewReader(b))
 		if err != nil {
 			return nil, err
 		}
 		req.Header.Set("Authorization", "Bearer "+a.Token)
-		client := &http.Client{Timeout: time.Second * 10}
+		client := &http.Client{Timeout: 10 * time.Second}
 		return client.Do(req)
 	}
 
-	res, err := doRequest()
-	if err != nil {
-		return err
-	}
+	// Retry loop handles three classes of response status:
+	//   - 401 Unauthorized: OAuth tokens expire after ~60 minutes and a
+	//     mid-session extend will land on a freshly-expired token. Refresh
+	//     and retry immediately (counts as one attempt, no backoff).
+	//   - 409 Conflict / 429 Too Many Requests: transient server-side
+	//     condition. Back off exponentially and retry.
+	//   - 200 OK: parse the new session expiry/token and return.
+	//   - anything else: surface as error immediately.
+	const maxRetries = 3
+	backoff := extendBackoffInitial
 
-	// OAuth tokens expire after ~60 minutes. Each Nest stream session
-	// runs up to ~60 minutes too, so it's normal for an extend mid-way
-	// through a session to land on a freshly-expired token. Refresh
-	// the token and retry once.
-	if res.StatusCode == 401 {
-		res.Body.Close()
-		// until_predicted_expiry sign distinguishes two cases:
-		//   positive: token rejected *before* our predicted expiry —
-		//     Google rotated early, or our cached ExpiresAt was wrong
-		//   negative: token was rejected *after* our predicted expiry —
-		//     we should have refreshed proactively (current code is
-		//     lazy 401-driven, so this is normal)
-		Log("info", "[nest] extend got 401, refreshing OAuth token",
-			"session", a.StreamSessionID,
-			"predicted_expires_at", a.ExpiresAt,
-			"until_predicted_expiry", time.Until(a.ExpiresAt).String())
-		if err := a.refreshToken(); err != nil {
-			return errors.New("nest: token refresh failed during extend: " + err.Error())
-		}
-		res, err = doRequest()
+	for attempt := 0; attempt < maxRetries; attempt++ {
+		res, err := doRequest()
 		if err != nil {
 			return err
 		}
+
+		if res.StatusCode == 401 && attempt < maxRetries-1 {
+			res.Body.Close()
+			// until_predicted_expiry sign distinguishes two cases:
+			//   positive: token rejected *before* our predicted expiry —
+			//     Google rotated early, or our cached ExpiresAt was wrong
+			//   negative: token was rejected *after* our predicted expiry —
+			//     we should have refreshed proactively (current code is
+			//     lazy 401-driven, so this is normal)
+			Log("info", "[nest] extend got 401, refreshing OAuth token",
+				"session", a.StreamSessionID,
+				"predicted_expires_at", a.ExpiresAt,
+				"until_predicted_expiry", time.Until(a.ExpiresAt).String(),
+				"attempt", attempt+1,
+				"max_attempts", maxRetries)
+			if err := a.refreshToken(); err != nil {
+				return errors.New("nest: token refresh failed during extend: " + err.Error())
+			}
+			continue
+		}
+
+		if (res.StatusCode == 409 || res.StatusCode == 429) && attempt < maxRetries-1 {
+			res.Body.Close()
+			Log("warn", "[nest] extend got transient status, backing off and retrying",
+				"session", a.StreamSessionID,
+				"status", res.Status,
+				"attempt", attempt+1,
+				"max_attempts", maxRetries,
+				"backoff", backoff.String())
+			time.Sleep(backoff)
+			backoff *= 2
+			continue
+		}
+
+		if res.StatusCode != 200 {
+			res.Body.Close()
+			return errors.New("nest: wrong status: " + res.Status)
+		}
+
+		var resv struct {
+			Results struct {
+				ExpiresAt            time.Time `json:"expiresAt"`
+				MediaSessionID       string    `json:"mediaSessionId"`
+				StreamExtensionToken string    `json:"streamExtensionToken"`
+				StreamToken          string    `json:"streamToken"`
+			} `json:"results"`
+		}
+
+		err = json.NewDecoder(res.Body).Decode(&resv)
+		res.Body.Close()
+		if err != nil {
+			return err
+		}
+
+		a.StreamSessionID = resv.Results.MediaSessionID
+		a.StreamExpiresAt = resv.Results.ExpiresAt
+		a.StreamExtensionToken = resv.Results.StreamExtensionToken
+		a.StreamToken = resv.Results.StreamToken
+
+		return nil
 	}
 
-	defer res.Body.Close()
-
-	if res.StatusCode != 200 {
-		return errors.New("nest: wrong status: " + res.Status)
-	}
-
-	var resv struct {
-		Results struct {
-			ExpiresAt            time.Time `json:"expiresAt"`
-			MediaSessionID       string    `json:"mediaSessionId"`
-			StreamExtensionToken string    `json:"streamExtensionToken"`
-			StreamToken          string    `json:"streamToken"`
-		} `json:"results"`
-	}
-
-	if err = json.NewDecoder(res.Body).Decode(&resv); err != nil {
-		return err
-	}
-
-	a.StreamSessionID = resv.Results.MediaSessionID
-	a.StreamExpiresAt = resv.Results.ExpiresAt
-	a.StreamExtensionToken = resv.Results.StreamExtensionToken
-	a.StreamToken = resv.Results.StreamToken
-
-	return nil
+	return errors.New("nest: extend max retries exceeded")
 }
 
 func (a *API) GenerateRtspStream(projectID, deviceID string) (string, error) {
@@ -482,11 +523,16 @@ func (a *API) GenerateRtspStream(projectID, deviceID string) (string, error) {
 
 	req.Header.Set("Authorization", "Bearer "+a.Token)
 
-	client := &http.Client{Timeout: time.Second * 5000}
+	// 10 s timeout — see GetDevices for context.
+	client := &http.Client{Timeout: 10 * time.Second}
 	res, err := client.Do(req)
 	if err != nil {
 		return "", err
 	}
+	// defer Close() to cover the non-200 / decode-error early returns; the
+	// original code only closed the body via the implicit decoder path on
+	// the success branch, leaking connections under sustained errors.
+	defer res.Body.Close()
 
 	if res.StatusCode != 200 {
 		return "", errors.New("nest: wrong status: " + res.Status)
@@ -546,11 +592,14 @@ func (a *API) StopRTSPStream() error {
 
 	req.Header.Set("Authorization", "Bearer "+a.Token)
 
-	client := &http.Client{Timeout: time.Second * 5000}
+	// 10 s timeout — see GetDevices for context.
+	client := &http.Client{Timeout: 10 * time.Second}
 	res, err := client.Do(req)
 	if err != nil {
 		return err
 	}
+	// defer Close() so the non-200 early return doesn't leak the connection.
+	defer res.Body.Close()
 
 	if res.StatusCode != 200 {
 		return errors.New("nest: wrong status: " + res.Status)

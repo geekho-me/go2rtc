@@ -368,6 +368,90 @@ as the primary client/source combination.
   `[nest] OAuth token refreshed` → `[nest] extend ok` in quick
   succession; stream continues uninterrupted.
 
+### 10c. ExtendStream 409/429 transient-status retry with exponential backoff
+
+- **Files:** `pkg/nest/api.go`, `pkg/nest/api_test.go`
+- **Change:** `ExtendStream()` is now a retry loop (maxRetries=3)
+  that distinguishes three retryable status classes:
+  - **401 Unauthorized** — token expired; refresh and retry
+    immediately (existing behaviour from §10b, now folded into the
+    same loop).
+  - **409 Conflict / 429 Too Many Requests** — transient server-side
+    condition; back off and retry. Initial back-off is 30 s,
+    doubled on each subsequent failure. Exposed as the package
+    variable `extendBackoffInitial` so tests can shorten it.
+  - **5xx and other non-retryable codes** — surface as error
+    immediately (not retried; the producer-level reconnect
+    machinery is the right place to absorb those).
+  Each retry attempt logs at warn level with the status, attempt
+  count, max attempts, and backoff duration.
+- **Why:** Google's SDM API returns 429 under client-side rate
+  limiting (which an aggressive extend loop can trigger after
+  many proactive reconnects) and 409 under transient session
+  conflicts. The previous implementation would surface either as
+  a hard error, killing the extend goroutine and forcing the
+  stream to die at its current `expires_at`. With the retry
+  loop, short-lived API hiccups are absorbed without disrupting
+  the stream.
+- **Test coverage:** `TestExtendStreamRetry` (6 sub-tests) drives
+  the retry loop with an `httptest` server hooked in via the new
+  `extendURI` package var: happy path (200), 429-then-200,
+  409-then-200, retry exhaustion (three consecutive 429s), 5xx
+  fail-fast, and backoff doubling between attempts. Uses
+  `extendBackoffInitial = 1ms` to keep tests fast.
+
+### 10d. Nest API hardening: HTTP timeouts + PeerConnection leak fixes
+
+- **Files:** `pkg/nest/api.go`, `pkg/nest/client.go`,
+  `internal/nest/init.go`
+- **Change:** Three latent reliability issues in the Nest API
+  surface, fixed together:
+  - **HTTP client timeout: `time.Second * 5000` → `10 * time.Second`**
+    in every `*http.Client` constructed by `NewAPI`, `GetDevices`,
+    `ExchangeSDP`, `GenerateRtspStream`, `StopRTSPStream`, and
+    `ExtendStream`. The 5000-second value is almost certainly a
+    typo for 5; with it, any hung Google API call could block a
+    go2rtc goroutine for ~83 minutes before timing out.
+  - **`PeerConnection` cleanup on `rtcConn` error paths.** The
+    WebRTC dial routine now calls `pc.Close()` whenever
+    `CreateCompleteOffer`, `ExchangeSDP`, or `SetAnswer` fails
+    before returning. Without this, every failed dial attempt
+    leaked a `PeerConnection` (UDP sockets, ICE state, DTLS
+    context); over many retry cycles under upstream throttling
+    or transient network issues this would slowly exhaust the
+    process's UDP-port and goroutine budget. Each close logs
+    at debug level with the original error for traceability.
+  - **`defer res.Body.Close()` added to `GenerateRtspStream` and
+    `StopRTSPStream`.** The original code only closed the response
+    body via the implicit JSON-decoder path on the success branch;
+    a non-200 response or a decode error left the body open,
+    leaking the underlying connection back to the pool.
+  - **Typo fixes:** `cliendID` → `clientID`, `cliendSecret` →
+    `clientSecret`, `compataiility` → `compatibility` in
+    `pkg/nest/client.go` and `internal/nest/init.go`.
+- **Why:** These bugs are independent of the OAuth/extend logic
+  we already fixed, but they all affect the long-term resource
+  hygiene of the Nest integration. The 5000-s timeout is the
+  most consequential — under any Google-side hang it would
+  silently park a goroutine for over an hour, holding state and
+  delaying error detection well past the points where the
+  proactive-reconnect (§12b) or extend-retry (§10c) machinery
+  could otherwise help.
+- **Source:** Items independently identified in the upstream PRs
+  https://github.com/AlexxIT/go2rtc/pull/2194 and
+  https://github.com/AlexxIT/go2rtc/pull/2128.
+- **Note (lessons learned):** These two upstream PRs were not
+  discovered until *after* the bulk of the Nest/UniFi reliability
+  work in this fork (§8b through §15) had been written and
+  deployed. Both PRs predate this fork's troubleshooting and
+  would have shortcut several rounds of diagnosis — particularly
+  the 5000-second HTTP timeout, which we missed entirely until
+  reading PR #2194. Future investigations into the Nest
+  integration (or any other upstream-maintained source) should
+  start with a scan of the upstream issue tracker and open PRs
+  before reaching for the debugger; this would have saved
+  multiple debugging sessions here.
+
 ---
 
 ## Observability
@@ -661,6 +745,12 @@ Additional tests added in this iteration:
   single-session passthrough, mid-stream SSRC change anchoring,
   relative-spacing preservation, and Replace state transfer to
   successor.
+- `pkg/nest/api_test.go::TestExtendStreamRetry` (6 sub-tests) —
+  covers the new ExtendStream retry loop (section 10c): happy
+  path, 429-then-success, 409-then-success, retry exhaustion
+  with three consecutive 429s, 5xx fail-fast (only 401/409/429
+  retried), and backoff doubling between attempts. Uses an
+  `httptest` server hooked in via the `extendURI` package var.
 - `internal/streams/stream_test.go::TestKickConsumers` (6 sub-tests
   including internal-loop-skip and grace-period bump/release —
   see section 8b/8b-1).

@@ -49,12 +49,12 @@ func Init() {
 
 func apiNest(w http.ResponseWriter, r *http.Request) {
 	query := r.URL.Query()
-	cliendID := query.Get("client_id")
-	cliendSecret := query.Get("client_secret")
+	clientID := query.Get("client_id")
+	clientSecret := query.Get("client_secret")
 	refreshToken := query.Get("refresh_token")
 	projectID := query.Get("project_id")
 
-	nestAPI, err := nest.NewAPI(cliendID, cliendSecret, refreshToken)
+	nestAPI, err := nest.NewAPI(clientID, clientSecret, refreshToken)
 	if err != nil {
 		http.Error(w, err.Error(), http.StatusInternalServerError)
 		return
