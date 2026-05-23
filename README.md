@@ -20,6 +20,12 @@
   </a>
 </p>
 
+> **This is a personal fork** of [AlexxIT/go2rtc](https://github.com/AlexxIT/go2rtc)
+> carrying additional reliability and observability changes — primarily targeting
+> the Nest WebRTC → go2rtc → UniFi Protect pipeline, but most fixes are
+> general-purpose and apply to any RTSP/ONVIF client or any Nest source.
+> See [CHANGES.md](CHANGES.md) for the full list of differences from upstream.
+
 Ultimate camera streaming application with support for dozens formats and protocols.
 
 - zero-dependency [small app](#go2rtc-binary) for all OS (Windows, macOS, Linux, FreeBSD)
